@@ -1,0 +1,6 @@
+node_modules/
+dist/
+profiles/
+logs/
+bundles/
+*.log
