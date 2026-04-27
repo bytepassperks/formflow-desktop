@@ -45,8 +45,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.0-electron
-          name: FormFlow Desktop Pro v2.0 (Electron)
+          tag_name: v2.0.1-electron
+          name: FormFlow Desktop Pro v2.0.1 (Electron)
           body: |
             ## FormFlow Desktop Pro v2.0 — Electron Edition
 

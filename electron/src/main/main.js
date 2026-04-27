@@ -193,6 +193,14 @@ ipcMain.handle('workflow:stop', async () => {
   return { stopped: true };
 });
 
+// Helper: create VPN controller from detected client info
+function createVPNController(clientInfo) {
+  const { VPNController } = require('../vpn/vpn-controller');
+  const controller = new VPNController(clientInfo.name, clientInfo.path, clientInfo.installDir);
+  controller.setLocations(clientInfo.locations);
+  return controller;
+}
+
 // VPN operations
 ipcMain.handle('vpn:scan', async () => {
   const { VPNDetector } = require('../vpn/vpn-detector');
@@ -201,10 +209,8 @@ ipcMain.handle('vpn:scan', async () => {
 
   // Auto-initialize controller with first detected client
   if (vpnState.detectedClients.length > 0 && !vpnState.controller) {
-    const { VPNController } = require('../vpn/vpn-controller');
     const firstClient = vpnState.detectedClients[0];
-    vpnState.controller = new VPNController(firstClient.name);
-    vpnState.controller.setLocations(firstClient.locations);
+    vpnState.controller = createVPNController(firstClient);
     vpnState.activeClient = firstClient.name;
   }
 
@@ -212,16 +218,16 @@ ipcMain.handle('vpn:scan', async () => {
 });
 
 ipcMain.handle('vpn:connect', async (event, { client, location }) => {
-  const { VPNController } = require('../vpn/vpn-controller');
-
-  // Find client's locations from scan results
+  // Find client info from scan results
   const clientInfo = vpnState.detectedClients.find(c => c.name === client);
 
-  // Create or update controller for this client
+  // Create or switch controller for this client (passes detected path)
   if (!vpnState.controller || vpnState.activeClient !== client) {
-    vpnState.controller = new VPNController(client);
     if (clientInfo) {
-      vpnState.controller.setLocations(clientInfo.locations);
+      vpnState.controller = createVPNController(clientInfo);
+    } else {
+      const { VPNController } = require('../vpn/vpn-controller');
+      vpnState.controller = new VPNController(client);
     }
     vpnState.activeClient = client;
   }
@@ -239,13 +245,14 @@ ipcMain.handle('vpn:disconnect', async () => {
 });
 
 ipcMain.handle('vpn:rotate', async (event, { client }) => {
-  const { VPNController } = require('../vpn/vpn-controller');
+  const clientInfo = vpnState.detectedClients.find(c => c.name === client);
 
   if (!vpnState.controller || vpnState.activeClient !== client) {
-    const clientInfo = vpnState.detectedClients.find(c => c.name === client);
-    vpnState.controller = new VPNController(client);
     if (clientInfo) {
-      vpnState.controller.setLocations(clientInfo.locations);
+      vpnState.controller = createVPNController(clientInfo);
+    } else {
+      const { VPNController } = require('../vpn/vpn-controller');
+      vpnState.controller = new VPNController(client);
     }
     vpnState.activeClient = client;
   }
@@ -253,10 +260,14 @@ ipcMain.handle('vpn:rotate', async (event, { client }) => {
   return vpnState.controller.switchNextLocation();
 });
 
-// Get VPN locations for a client
+// Get VPN locations for a client (with labels)
 ipcMain.handle('vpn:getLocations', async (event, { client }) => {
   const clientInfo = vpnState.detectedClients.find(c => c.name === client);
-  return clientInfo ? clientInfo.locations : [];
+  if (!clientInfo) return [];
+  return {
+    locations: clientInfo.locations,
+    labels: clientInfo.locationLabels || null,
+  };
 });
 
 // Debug operations

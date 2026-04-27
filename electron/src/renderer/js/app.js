@@ -252,15 +252,22 @@ function populateLocations(clientInfo) {
   const locSelect = document.getElementById('vpnLocationSelect');
   locSelect.innerHTML = '';
   if (clientInfo && clientInfo.locations) {
+    const labels = clientInfo.locationLabels || {};
     clientInfo.locations.forEach(loc => {
       const opt = document.createElement('option');
       opt.value = loc;
-      opt.textContent = loc;
+      opt.textContent = labels[loc] || loc;
       locSelect.appendChild(opt);
     });
   } else {
     locSelect.innerHTML = '<option value="">No locations available</option>';
   }
+}
+
+function getLocationLabel(clientInfo, code) {
+  if (!clientInfo) return code;
+  const labels = clientInfo.locationLabels || {};
+  return labels[code] || code;
 }
 
 // When client dropdown changes, update locations
@@ -273,10 +280,11 @@ document.getElementById('vpnClientSelect').addEventListener('change', () => {
   const queueEl = document.getElementById('locationQueue');
   queueEl.innerHTML = '';
   if (clientInfo) {
+    const labels = clientInfo.locationLabels || {};
     clientInfo.locations.forEach((loc, i) => {
       const item = document.createElement('span');
       item.className = `location-item${i === 0 ? ' active' : ''}`;
-      item.textContent = loc;
+      item.textContent = labels[loc] || loc;
       queueEl.appendChild(item);
     });
   }
@@ -317,10 +325,11 @@ document.getElementById('scanVpnBtn').addEventListener('click', async () => {
     // Populate location queue display
     const queueEl = document.getElementById('locationQueue');
     queueEl.innerHTML = '';
+    const firstLabels = clients[0].locationLabels || {};
     clients[0].locations.forEach((loc, i) => {
       const item = document.createElement('span');
       item.className = `location-item${i === 0 ? ' active' : ''}`;
-      item.textContent = loc;
+      item.textContent = firstLabels[loc] || loc;
       queueEl.appendChild(item);
     });
 
@@ -338,20 +347,35 @@ document.getElementById('vpnConnectBtn').addEventListener('click', async () => {
   const client = document.getElementById('vpnClientSelect').value;
   const location = document.getElementById('vpnLocationSelect').value;
   if (!client) return alert('No VPN client selected');
+  if (!location) return alert('No VPN location selected');
 
-  addEvent('vpn', 'vpn_connect_attempt', `Connecting to ${client}...`);
-  document.getElementById('vpnStatus').textContent = 'Status: Connecting...';
+  const clientInfo = vpnClients.find(c => c.name === client);
+  const locLabel = getLocationLabel(clientInfo, location);
 
-  const result = await window.formflow.connectVPN(client, location);
-  if (result && result.success) {
-    document.getElementById('vpnStatus').textContent = `Status: Connected (${result.location || location})`;
-    document.getElementById('vpnBadge').textContent = `VPN: ${result.location || client}`;
-    document.getElementById('vpnBadge').className = 'badge badge-green';
-    addEvent('vpn', 'vpn_connected', `Connected to ${result.location || location}`);
-  } else {
-    document.getElementById('vpnStatus').textContent = `Status: Connection failed`;
-    addEvent('vpn', 'vpn_connection_failed', result?.error || 'Failed to connect');
+  addEvent('vpn', 'vpn_connect_attempt', `Connecting to ${client} → ${locLabel}...`);
+  document.getElementById('vpnStatus').textContent = `Status: Connecting to ${locLabel}...`;
+  document.getElementById('vpnConnectBtn').disabled = true;
+
+  try {
+    const result = await window.formflow.connectVPN(client, location);
+    if (result && result.success) {
+      document.getElementById('vpnStatus').textContent = `Status: Connected (${locLabel}) — IP: ${result.ip || 'N/A'}`;
+      document.getElementById('vpnBadge').textContent = `VPN: ${locLabel}`;
+      document.getElementById('vpnBadge').className = 'badge badge-green';
+      document.getElementById('ipBadge').textContent = `IP: ${result.ip || 'N/A'}`;
+      document.getElementById('ipBadge').className = 'badge badge-blue';
+      addEvent('vpn', 'vpn_connected', `Connected to ${client} → ${locLabel} (IP: ${result.ip || 'N/A'})`);
+    } else {
+      document.getElementById('vpnStatus').textContent = `Status: Connection failed`;
+      document.getElementById('vpnBadge').className = 'badge badge-red';
+      addEvent('vpn', 'vpn_connection_failed', result?.error || 'Failed to connect');
+    }
+  } catch (err) {
+    document.getElementById('vpnStatus').textContent = `Status: Error — ${err.message}`;
+    addEvent('vpn', 'vpn_connection_failed', err.message);
   }
+
+  document.getElementById('vpnConnectBtn').disabled = false;
 });
 
 document.getElementById('vpnDisconnectBtn').addEventListener('click', async () => {
