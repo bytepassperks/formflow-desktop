@@ -27,7 +27,7 @@ jobs:
 
       - name: Build Windows portable exe
         working-directory: electron
-        run: npx electron-builder --win portable --x64
+        run: npx electron-builder --win portable --x64 --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -35,14 +35,14 @@ jobs:
         working-directory: electron/dist
         run: dir
 
-      - name: Upload portable exe
+      - name: Upload portable exe as artifact
         uses: actions/upload-artifact@v4
         with:
           name: FormFlowDesktopPro-Windows
           path: electron/dist/*.exe
-          retention-days: 30
+          retention-days: 90
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2.0.0-electron
