@@ -6,11 +6,22 @@ Build command:
 
 Output:
     dist/FormFlowDesktopPro.exe
+
+Bundles:
+    - Custom Chromium browser with stealth flags (browser/ directory)
+    - Configuration files
+    - All automation, VPN, debug, and UI modules
 """
 
 import os
 
 block_cipher = None
+
+# Detect bundled Chromium browser directory
+browser_dir = os.path.join(os.getcwd(), 'browser')
+browser_datas = []
+if os.path.isdir(browser_dir):
+    browser_datas.append((browser_dir, 'browser'))
 
 a = Analysis(
     ['main.py'],
@@ -18,7 +29,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('config/default_config.json', 'config'),
-    ],
+    ] + browser_datas,
     hiddenimports=[
         'PyQt5',
         'PyQt5.QtCore',
@@ -34,6 +45,27 @@ a = Analysis(
         'uuid',
         'threading',
         'logging',
+        'automation.chromium_manager',
+        'automation.captcha_monitor',
+        'automation.environment_simulator',
+        'automation.profile_manager',
+        'automation.retry_engine',
+        'automation.workflow_engine',
+        'automation.workflow_scheduler',
+        'vpn.vpn_controller',
+        'vpn.vpn_detector',
+        'vpn.vpn_scheduler',
+        'debug.debug_logger',
+        'debug.network_snapshot',
+        'debug.screenshot_manager',
+        'debug.bundle_exporter',
+        'ui.browser_panel',
+        'ui.debug_panel',
+        'ui.main_window',
+        'ui.styles',
+        'ui.timeline_panel',
+        'ui.vpn_panel',
+        'ui.workflow_panel',
     ],
     hookspath=[],
     hooksconfig={},

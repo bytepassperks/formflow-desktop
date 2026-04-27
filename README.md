@@ -25,8 +25,14 @@ Configurable concurrency (1–5 simultaneous workflows) using an asyncio task po
 ### 3. Browser Environment Simulation Layer
 Each profile optionally randomizes: timezone, locale, viewport size, user agent, color scheme, and language header.
 
-### 4. VPN Rotation Scheduler
+### 4. VPN Rotation Scheduler with Auto-Connect & Auto-Rotate
 Auto-detects installed VPN clients (NordVPN, Surfshark, ExpressVPN) by scanning Program Files, PATH variables, and registry entries. Executes connect → verify IP → run workflow → switch location → repeat pipeline with 20-second IP change timeout.
+
+**New:** Fully automatic VPN management:
+- **Auto-Connect**: VPN connects automatically before workflow execution starts — no manual click needed
+- **Auto-Rotate**: VPN location rotates automatically between workflow runs
+- **Rotation Strategies**: Round Robin, Random, Sequential
+- **Configurable Frequency**: Rotate every N workflows
 
 ### 5. Smart Workflow Retry Engine
 Retry on timeout, selector failure, navigation failure, form validation rejection, or network error. Configurable max retries (default: 2) with VPN location switch between attempts.
@@ -53,6 +59,19 @@ Exports `debug_session.json`, `errors.log`, `network_snapshot.json`, screenshots
 ### 12. Execution Timeline Viewer
 Vertical timeline log stream showing: VPN connected → IP verified → browser launched → selectors filled → form submitted → result received. With category color-coding and filtering.
 
+### 13. Bundled Custom Chromium Browser (**NEW**)
+Ships a fully custom Chromium browser bundled with the application. Critical automation-detection flags are disabled:
+- `navigator.webdriver` removed
+- Automation info bar disabled
+- `--disable-blink-features=AutomationControlled`
+- Sandbox, web security, CORS restrictions disabled for testing
+- Certificate errors ignored
+- Background networking/updates disabled
+- Anti-detection JavaScript injected on every page load
+- No external browser installation required
+
+Chromium can be downloaded from the **Browser** tab in the UI and is automatically bundled into the `.exe` via PyInstaller.
+
 ## Project Structure
 
 ```
@@ -60,14 +79,17 @@ formflow-desktop/
 ├── main.py                          # Application entry point
 ├── formflow.spec                    # PyInstaller build spec
 ├── requirements.txt                 # Python dependencies
+├── browser/                         # Bundled Chromium browser
 ├── ui/
 │   ├── main_window.py               # Main application window
 │   ├── workflow_panel.py            # Workflow configuration panel
+│   ├── browser_panel.py             # Bundled Chromium management panel
 │   ├── debug_panel.py               # Debug console panel
 │   ├── timeline_panel.py            # Execution timeline viewer
-│   ├── vpn_panel.py                 # VPN management panel
+│   ├── vpn_panel.py                 # VPN management panel (auto-connect/rotate)
 │   └── styles.py                    # UI stylesheet definitions
 ├── automation/
+│   ├── chromium_manager.py          # Bundled Chromium download/launch/stealth
 │   ├── workflow_engine.py           # Playwright workflow runner
 │   ├── workflow_scheduler.py        # Parallel execution scheduler
 │   ├── profile_manager.py          # Browser profile isolation
@@ -77,7 +99,7 @@ formflow-desktop/
 ├── vpn/
 │   ├── vpn_detector.py             # VPN client auto-detection
 │   ├── vpn_controller.py           # VPN connect/disconnect/switch
-│   └── vpn_scheduler.py            # VPN rotation scheduling
+│   └── vpn_scheduler.py            # VPN rotation (auto-connect/rotate)
 ├── debug/
 │   ├── debug_logger.py             # Structured JSON telemetry
 │   ├── screenshot_manager.py       # Screenshot capture engine
@@ -113,9 +135,19 @@ venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Install Playwright browsers
+# Install Playwright browsers (optional if using bundled Chromium)
 playwright install chromium
 ```
+
+### Download Bundled Chromium
+
+The app can download and bundle its own custom Chromium:
+1. Run the app: `python main.py`
+2. Go to the **Browser** tab
+3. Click **Download Chromium**
+4. The browser is extracted to `browser/` and used for all workflows
+
+Alternatively, workflows will fall back to Playwright's default Chromium if no bundled browser is found.
 
 ### Run
 
@@ -126,7 +158,7 @@ python main.py
 ### Build Executable
 
 ```bash
-# Build with PyInstaller
+# Build with PyInstaller (auto-bundles Chromium if present in browser/)
 pyinstaller formflow.spec
 
 # Output: dist/FormFlowDesktopPro.exe
@@ -134,11 +166,12 @@ pyinstaller formflow.spec
 
 ## Quick Start
 
-1. **Configure Workflow**: Enter target URL, add credentials, define workflow steps (navigate, fill, click, etc.)
-2. **Set Execution Options**: Parallel runs (1-5), max retries, timeouts
-3. **Optional VPN**: Scan for installed VPN clients, configure rotation
-4. **Start**: Click "Start Workflow" — monitor progress in Debug Console and Timeline tabs
-5. **Debug**: Use debug panel for live events, export logs, or generate troubleshooting bundle
+1. **Setup Browser**: Go to Browser tab → Download Chromium (one-time setup)
+2. **Configure Workflow**: Enter target URL, add credentials, define workflow steps (navigate, fill, click, etc.)
+3. **Set Execution Options**: Parallel runs (1-5), max retries, timeouts
+4. **VPN**: Scan for installed clients. Enable auto-connect and auto-rotate in the VPN tab — VPN connects and rotates automatically
+5. **Start**: Click "Start Workflow" — VPN auto-connects, browser launches with stealth flags, workflows execute
+6. **Debug**: Use debug panel for live events, export logs, or generate troubleshooting bundle
 
 ## Workflow Step Types
 

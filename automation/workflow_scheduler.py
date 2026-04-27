@@ -68,10 +68,12 @@ class WorkflowScheduler:
         engine: WorkflowEngine,
         logger: DebugLogger,
         scheduler_config: Optional[SchedulerConfig] = None,
+        vpn_scheduler: Optional[object] = None,
     ):
         self._engine = engine
         self._logger = logger
         self._config = scheduler_config or SchedulerConfig()
+        self._vpn_scheduler = vpn_scheduler
         self._job_queue: Deque[WorkflowJob] = deque()
         self._results: List[WorkflowResult] = []
         self._running = False
@@ -127,7 +129,11 @@ class WorkflowScheduler:
     async def _run_job(
         self, job: WorkflowJob, semaphore: asyncio.Semaphore
     ) -> None:
-        """Execute a single job within the semaphore-controlled pool."""
+        """Execute a single job within the semaphore-controlled pool.
+
+        After each job completes, auto-rotates VPN location if a
+        VPN scheduler is configured with auto_rotate enabled.
+        """
         async with semaphore:
             try:
                 result = await self._engine.execute(
@@ -141,6 +147,20 @@ class WorkflowScheduler:
                     self._completed_count += 1
                 else:
                     self._failed_count += 1
+
+                # Auto-rotate VPN after job completion
+                if self._vpn_scheduler:
+                    try:
+                        new_loc = await self._vpn_scheduler.auto_rotate_if_needed()
+                        if new_loc:
+                            self._logger.log(
+                                EventType.VPN_LOCATION_SWITCHED,
+                                status="success",
+                                vpn_location=new_loc,
+                                details={"auto_rotate": True},
+                            )
+                    except Exception:
+                        pass
 
                 if self._on_job_complete:
                     try:

@@ -1,6 +1,6 @@
 {
     "app_name": "FormFlow Desktop Pro",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "max_parallel_runs": 3,
     "max_retries": 2,
     "vpn_timeout_seconds": 20,
@@ -13,7 +13,20 @@
     "screenshot_dir": "logs/screenshots",
     "bundle_dir": "bundles",
     "profiles_dir": "profiles",
+    "browser_dir": "browser",
     "supported_vpn_clients": ["NordVPN", "Surfshark", "ExpressVPN"],
+    "bundled_browser": {
+        "enabled": true,
+        "revision": "1300313",
+        "stealth_mode": true,
+        "auto_download": false
+    },
+    "vpn_automation": {
+        "auto_connect": true,
+        "auto_rotate": true,
+        "rotation_strategy": "round_robin",
+        "rotate_every_n": 1
+    },
     "environment_presets": {
         "timezones": [
             "Asia/Kolkata",

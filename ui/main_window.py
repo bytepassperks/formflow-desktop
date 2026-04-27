@@ -1,7 +1,7 @@
 """Main application window for FormFlow Desktop Pro.
 
-Integrates all UI panels: workflow configuration, debug console,
-execution timeline, VPN management, and status bar.
+Integrates all UI panels: workflow configuration, browser management,
+VPN management, debug console, execution timeline, and status bar.
 """
 
 import asyncio
@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from ui.browser_panel import BrowserPanel
 from ui.debug_panel import DebugPanel
 from ui.styles import MAIN_STYLESHEET
 from ui.timeline_panel import TimelinePanel
@@ -38,7 +39,13 @@ from ui.workflow_panel import WorkflowPanel
 
 
 class WorkflowWorker(QObject):
-    """Background worker for running workflows without blocking the UI."""
+    """Background worker for running workflows without blocking the UI.
+
+    Integrates:
+    - Bundled Chromium with stealth flags
+    - VPN auto-connect before first workflow
+    - VPN auto-rotate between workflow runs
+    """
 
     event_emitted = pyqtSignal(dict)
     progress_updated = pyqtSignal(dict)
@@ -67,8 +74,9 @@ class WorkflowWorker(QObject):
             self._running = False
 
     async def _execute(self, params: dict) -> list:
-        """Async workflow execution."""
+        """Async workflow execution with bundled browser and VPN automation."""
         from automation.captcha_monitor import CaptchaMonitor
+        from automation.chromium_manager import ChromiumManager
         from automation.environment_simulator import EnvironmentSimulator
         from automation.profile_manager import ProfileManager
         from automation.retry_engine import RetryEngine
@@ -81,6 +89,7 @@ class WorkflowWorker(QObject):
         from debug.debug_logger import DebugLogger, EventType
         from debug.network_snapshot import NetworkSnapshot
         from debug.screenshot_manager import ScreenshotManager
+        from vpn.vpn_scheduler import RotationStrategy, VPNScheduler
 
         logger = DebugLogger()
         logger.add_listener(lambda e: self.event_emitted.emit(e))
@@ -88,16 +97,75 @@ class WorkflowWorker(QObject):
         logger.log(EventType.APP_START, status="success")
         logger.log(EventType.CONFIG_LOADED, status="success")
 
+        # Initialize bundled Chromium
+        chromium_mgr = ChromiumManager(debug_logger=logger)
+        logger.log(
+            EventType.BROWSER_LAUNCH,
+            status="info",
+            details={
+                "bundled_chromium_installed": chromium_mgr.is_installed,
+                "stealth_args": len(chromium_mgr.get_stealth_args()),
+            },
+        )
+
         profile_mgr = ProfileManager()
         env_sim = EnvironmentSimulator()
         screenshot_mgr = ScreenshotManager()
         network = NetworkSnapshot()
         captcha_mon = CaptchaMonitor()
 
+        # VPN auto-connect and auto-rotate setup
+        vpn_settings = params.get("vpn_settings", {})
+        auto_connect = vpn_settings.get("auto_connect", True)
+        auto_rotate = vpn_settings.get("auto_rotate", True)
+        strategy_str = vpn_settings.get("rotation_strategy", "round_robin")
+        rotate_every_n = vpn_settings.get("rotate_every_n", 1)
+
+        strategy_map = {
+            "round_robin": RotationStrategy.ROUND_ROBIN,
+            "random": RotationStrategy.RANDOM,
+            "sequential": RotationStrategy.SEQUENTIAL,
+        }
+        rotation_strategy = strategy_map.get(strategy_str, RotationStrategy.ROUND_ROBIN)
+
+        vpn_scheduler = VPNScheduler(
+            debug_logger=logger,
+            auto_connect=auto_connect,
+            auto_rotate=auto_rotate,
+            rotation_strategy=rotation_strategy,
+        )
+        vpn_scheduler.set_rotate_every_n(rotate_every_n)
+
+        # Auto-detect VPN clients
+        vpn_clients = vpn_scheduler.detect_clients()
+
+        # Auto-connect VPN before starting workflows
+        if auto_connect and vpn_scheduler.has_vpn():
+            logger.log(
+                EventType.VPN_CONNECT_ATTEMPT,
+                status="info",
+                details={"auto_connect": True},
+            )
+            connected = await vpn_scheduler.auto_connect_if_enabled()
+            if connected:
+                logger.log(
+                    EventType.VPN_CONNECTED,
+                    status="success",
+                    vpn_location=vpn_scheduler.get_current_location(),
+                    details={"auto_connect": True},
+                )
+            else:
+                logger.log(
+                    EventType.VPN_CONNECTION_FAILED,
+                    status="warning",
+                    details={"auto_connect": True, "reason": "no_vpn_or_failed"},
+                )
+
         max_retries = params.get("max_retries", 2)
         retry_engine = RetryEngine(
             max_retries=max_retries,
             debug_logger=logger,
+            vpn_controller=vpn_scheduler._controller if vpn_scheduler.has_vpn() else None,
         )
 
         engine = WorkflowEngine(
@@ -108,6 +176,7 @@ class WorkflowWorker(QObject):
             network_snapshot=network,
             captcha_monitor=captcha_mon,
             retry_engine=retry_engine,
+            chromium_manager=chromium_mgr,
         )
 
         scheduler_config = SchedulerConfig(
@@ -118,6 +187,7 @@ class WorkflowWorker(QObject):
             engine=engine,
             logger=logger,
             scheduler_config=scheduler_config,
+            vpn_scheduler=vpn_scheduler if vpn_scheduler.has_vpn() else None,
         )
         scheduler.set_on_progress_callback(
             lambda p: self.progress_updated.emit(p)
@@ -137,8 +207,13 @@ class WorkflowWorker(QObject):
             )
             scheduler.add_job(job)
 
-        results = await scheduler.run_all()
-        return [r.to_dict() for r in results]
+        results_list = await scheduler.run_all()
+
+        # Disconnect VPN when done
+        if vpn_scheduler.has_vpn() and vpn_scheduler.is_connected():
+            await vpn_scheduler.disconnect()
+
+        return [r.to_dict() for r in results_list]
 
 
 class MainWindow(QMainWindow):
@@ -174,11 +249,15 @@ class MainWindow(QMainWindow):
         self._workflow_panel = WorkflowPanel()
         self._tabs.addTab(self._workflow_panel, "Workflow")
 
-        # Tab 2: VPN Management
+        # Tab 2: Browser Management
+        self._browser_panel = BrowserPanel()
+        self._tabs.addTab(self._browser_panel, "Browser")
+
+        # Tab 3: VPN Management
         self._vpn_panel = VPNPanel()
         self._tabs.addTab(self._vpn_panel, "VPN")
 
-        # Tab 3: Debug Console + Timeline (split)
+        # Tab 4: Debug Console + Timeline (split)
         debug_tab = QWidget()
         debug_layout = QHBoxLayout(debug_tab)
 
@@ -235,6 +314,15 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+        # Browser Menu
+        browser_menu = menubar.addMenu("Browser")
+
+        download_chromium_action = QAction("Download Bundled Chromium", self)
+        download_chromium_action.triggered.connect(
+            lambda: self._tabs.setCurrentWidget(self._browser_panel)
+        )
+        browser_menu.addAction(download_chromium_action)
+
         # Debug Menu
         debug_menu = menubar.addMenu("Debug")
 
@@ -262,13 +350,25 @@ class MainWindow(QMainWindow):
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
 
+        self._status_browser = QLabel("Browser: Checking...")
         self._status_vpn = QLabel("VPN: N/A")
         self._status_ip = QLabel("IP: N/A")
         self._status_workflows = QLabel("Workflows: 0/0")
 
+        self._status_bar.addPermanentWidget(self._status_browser)
         self._status_bar.addPermanentWidget(self._status_vpn)
         self._status_bar.addPermanentWidget(self._status_ip)
         self._status_bar.addPermanentWidget(self._status_workflows)
+
+        # Check browser status
+        from automation.chromium_manager import ChromiumManager
+        mgr = ChromiumManager()
+        if mgr.is_installed:
+            self._status_browser.setText("Browser: Bundled Chromium")
+            self._status_browser.setStyleSheet("color: #2ed573;")
+        else:
+            self._status_browser.setText("Browser: Not installed")
+            self._status_browser.setStyleSheet("color: #e74c3c;")
 
         self._status_bar.showMessage("Ready — Configure a workflow to begin")
 
@@ -291,15 +391,18 @@ class MainWindow(QMainWindow):
             return
 
         settings = self._workflow_panel.get_execution_settings()
+        vpn_settings = self._vpn_panel.get_vpn_settings()
+
         params = {
             "workflow_config": config.to_dict(),
             "max_parallel_runs": settings["max_parallel_runs"],
             "max_retries": settings["max_retries"],
             "num_profiles": settings["num_profiles"],
+            "vpn_settings": vpn_settings,
         }
 
         self._workflow_panel.set_running(True)
-        self._tabs.setCurrentIndex(2)  # Switch to debug tab
+        self._tabs.setCurrentIndex(3)  # Switch to debug tab
         self._progress_label.setText("Running workflows...")
         self._status_bar.showMessage("Executing workflows...")
 
@@ -309,6 +412,7 @@ class MainWindow(QMainWindow):
 
         self._worker.event_emitted.connect(self._debug_panel.on_event)
         self._worker.event_emitted.connect(self._timeline_panel.on_event)
+        self._worker.event_emitted.connect(self._update_status_from_event)
         self._worker.progress_updated.connect(self._on_progress_update)
         self._worker.finished.connect(self._on_workflow_finished)
         self._worker.error.connect(self._on_workflow_error)
@@ -323,6 +427,23 @@ class MainWindow(QMainWindow):
         self._workflow_panel.set_running(False)
         self._progress_label.setText("Stopped")
         self._status_bar.showMessage("Workflow execution stopped")
+
+    @pyqtSlot(dict)
+    def _update_status_from_event(self, event: dict) -> None:
+        """Update status bar from live debug events."""
+        event_type = event.get("event", "")
+
+        if event.get("vpn_location"):
+            if "connected" in event_type:
+                loc = event["vpn_location"]
+                self._status_vpn.setText(f"VPN: {loc}")
+                self._status_vpn.setStyleSheet("color: #2ed573;")
+            elif "disconnect" in event_type:
+                self._status_vpn.setText("VPN: Disconnected")
+                self._status_vpn.setStyleSheet("color: #ffa502;")
+
+        if event.get("ip_address"):
+            self._status_ip.setText(f"IP: {event['ip_address']}")
 
     @pyqtSlot(dict)
     def _on_progress_update(self, progress: dict) -> None:
@@ -455,16 +576,17 @@ class MainWindow(QMainWindow):
             self,
             "About FormFlow Desktop Pro",
             "<h2>FormFlow Desktop Pro</h2>"
-            "<p>Version 1.0.0</p>"
+            "<p>Version 1.1.0</p>"
             "<p>Network & Environment-Aware Registration Workflow "
             "Testing Studio</p>"
             "<hr>"
             "<p><b>Features:</b></p>"
             "<ul>"
+            "<li>Bundled Chromium with stealth flags</li>"
             "<li>Multi-profile browser isolation</li>"
             "<li>Parallel workflow execution</li>"
             "<li>Browser environment simulation</li>"
-            "<li>VPN rotation scheduling</li>"
+            "<li>VPN auto-connect &amp; auto-rotate</li>"
             "<li>Smart retry engine</li>"
             "<li>CAPTCHA detection monitoring</li>"
             "<li>Structured debug telemetry</li>"

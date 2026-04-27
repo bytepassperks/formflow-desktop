@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from automation.captcha_monitor import CaptchaMonitor
+from automation.chromium_manager import ChromiumManager
 from automation.environment_simulator import EnvironmentSimulator
 from automation.profile_manager import ProfileManager
 from automation.retry_engine import (
@@ -166,6 +167,7 @@ class WorkflowEngine:
         network_snapshot: NetworkSnapshot,
         captcha_monitor: Optional[CaptchaMonitor] = None,
         retry_engine: Optional[RetryEngine] = None,
+        chromium_manager: Optional[ChromiumManager] = None,
     ):
         self._logger = logger
         self._profile_manager = profile_manager
@@ -174,6 +176,7 @@ class WorkflowEngine:
         self._network = network_snapshot
         self._captcha = captcha_monitor or CaptchaMonitor()
         self._retry = retry_engine
+        self._chromium = chromium_manager or ChromiumManager(debug_logger=logger)
 
     async def execute(
         self,
@@ -272,30 +275,49 @@ class WorkflowEngine:
         profile_id: str,
         **kwargs: Any,
     ) -> None:
-        """Internal workflow runner inside a Playwright context."""
+        """Internal workflow runner inside a Playwright context.
+
+        Uses the bundled custom Chromium with stealth flags disabled to
+        avoid automation detection. Injects anti-detection JS on every page.
+        """
         from playwright.async_api import async_playwright
 
         context_options = self._env_simulator.apply_to_playwright_context(fingerprint)
+
+        launch_opts = self._chromium.get_persistent_context_options(
+            profile_path=profile_path,
+            context_overrides=context_options,
+            headless=False,
+        )
 
         self._logger.log(
             EventType.BROWSER_LAUNCH,
             workflow_id=workflow_id_param,
             profile_id=profile_id,
-            details={"fingerprint": fingerprint},
+            details={
+                "fingerprint": fingerprint,
+                "bundled_chromium": self._chromium.is_installed,
+                "stealth_args_count": len(self._chromium.get_stealth_args()),
+            },
         )
 
         async with async_playwright() as p:
             context = await p.chromium.launch_persistent_context(
                 profile_path,
-                headless=False,
-                **context_options,
+                **launch_opts,
             )
 
             page = await context.new_page()
+
+            # Inject stealth anti-detection script on every navigation
+            stealth_js = ChromiumManager.get_stealth_init_script()
+            await context.add_init_script(stealth_js)
+
             self._logger.log(
                 EventType.PAGE_OPEN,
                 workflow_id=workflow_id_param,
                 url=config.target_url,
+                details={"stealth_injected": True},
             )
 
             await self._network.capture(
