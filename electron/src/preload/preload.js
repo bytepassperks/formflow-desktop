@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('formflow', {
   connectVPN: (client, location) => ipcRenderer.invoke('vpn:connect', { client, location }),
   disconnectVPN: () => ipcRenderer.invoke('vpn:disconnect'),
   rotateVPN: (client) => ipcRenderer.invoke('vpn:rotate', { client }),
+  getVPNLocations: (client) => ipcRenderer.invoke('vpn:getLocations', { client }),
 
   // Debug operations
   exportLogs: () => ipcRenderer.invoke('debug:exportLogs'),

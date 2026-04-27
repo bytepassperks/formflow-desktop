@@ -245,9 +245,47 @@ window.formflow.onWorkflowProgress((progress) => {
 // ═══════════════════════════════════════════════════
 // VPN Controls
 // ═══════════════════════════════════════════════════
+// Store scan results for location population
+let vpnClients = [];
+
+function populateLocations(clientInfo) {
+  const locSelect = document.getElementById('vpnLocationSelect');
+  locSelect.innerHTML = '';
+  if (clientInfo && clientInfo.locations) {
+    clientInfo.locations.forEach(loc => {
+      const opt = document.createElement('option');
+      opt.value = loc;
+      opt.textContent = loc;
+      locSelect.appendChild(opt);
+    });
+  } else {
+    locSelect.innerHTML = '<option value="">No locations available</option>';
+  }
+}
+
+// When client dropdown changes, update locations
+document.getElementById('vpnClientSelect').addEventListener('change', () => {
+  const selected = document.getElementById('vpnClientSelect').value;
+  const clientInfo = vpnClients.find(c => c.name === selected);
+  populateLocations(clientInfo);
+
+  // Update queue display
+  const queueEl = document.getElementById('locationQueue');
+  queueEl.innerHTML = '';
+  if (clientInfo) {
+    clientInfo.locations.forEach((loc, i) => {
+      const item = document.createElement('span');
+      item.className = `location-item${i === 0 ? ' active' : ''}`;
+      item.textContent = loc;
+      queueEl.appendChild(item);
+    });
+  }
+});
+
 document.getElementById('scanVpnBtn').addEventListener('click', async () => {
   addEvent('vpn', 'vpn_scan', 'Scanning for VPN clients...');
   const clients = await window.formflow.scanVPN();
+  vpnClients = clients || [];
 
   const listEl = document.getElementById('vpnClientsList');
   const selectEl = document.getElementById('vpnClientSelect');
@@ -273,7 +311,20 @@ document.getElementById('scanVpnBtn').addEventListener('click', async () => {
       selectEl.appendChild(option);
     });
 
-    addEvent('vpn', 'vpn_detected', `Found ${clients.length} VPN client(s)`);
+    // Populate locations for first client
+    populateLocations(clients[0]);
+
+    // Populate location queue display
+    const queueEl = document.getElementById('locationQueue');
+    queueEl.innerHTML = '';
+    clients[0].locations.forEach((loc, i) => {
+      const item = document.createElement('span');
+      item.className = `location-item${i === 0 ? ' active' : ''}`;
+      item.textContent = loc;
+      queueEl.appendChild(item);
+    });
+
+    addEvent('vpn', 'vpn_detected', `Found ${clients.length} VPN client(s): ${clients.map(c => c.name).join(', ')}`);
     document.getElementById('vpnBadge').textContent = `VPN: ${clients[0].name}`;
     document.getElementById('vpnBadge').className = 'badge badge-blue';
   } else {

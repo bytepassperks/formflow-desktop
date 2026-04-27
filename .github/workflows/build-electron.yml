@@ -1,0 +1,73 @@
+name: Build Electron App
+
+on:
+  push:
+    branches:
+      - 'devin/*electron*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: electron
+        run: npm install
+
+      - name: Build Windows portable exe
+        working-directory: electron
+        run: npx electron-builder --win portable --x64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List build output
+        working-directory: electron/dist
+        run: dir
+
+      - name: Upload portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: FormFlowDesktopPro-Windows
+          path: electron/dist/*.exe
+          retention-days: 30
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.0.0-electron
+          name: FormFlow Desktop Pro v2.0 (Electron)
+          body: |
+            ## FormFlow Desktop Pro v2.0 — Electron Edition
+
+            **Chromium is embedded** — no separate browser download needed.
+
+            ### Features
+            - 25+ stealth Chromium flags applied at process level
+            - Anti-detection JS injection (navigator.webdriver removed, plugins spoofed, etc.)
+            - VPN auto-connect & auto-rotate (NordVPN, Surfshark, ExpressVPN)
+            - Multi-profile browser isolation
+            - Parallel workflow execution (1-5 concurrent)
+            - CAPTCHA detection (detect only)
+            - Structured debug logger with live event stream
+            - Debug bundle exporter
+
+            ### How to use
+            1. Download `FormFlowDesktopPro.exe` below
+            2. Run it — no installation needed (portable)
+            3. Configure workflows, VPN, and start testing
+          draft: false
+          prerelease: false
+          files: electron/dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
