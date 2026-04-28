@@ -3,15 +3,21 @@
  *
  * Executes registration workflows using Puppeteer connected to
  * real Chrome (auto-detected) or Electron's Chromium as fallback.
- * Uses nativeInputValueSetter for React form compatibility.
+ *
+ * VAPI registration uses a hybrid approach:
+ * 1. Browser navigates to register page → Cloudflare Turnstile solves
+ * 2. Turnstile token extracted from page
+ * 3. Supabase signup API called directly with the token
+ *    (bypasses React form entirely — no need to fight controlled inputs)
+ * 4. Login also uses Turnstile token + Supabase token API
  *
  * Supports:
- * - Real Chrome detection (preferred for React form compatibility)
+ * - Real Chrome detection (preferred — Turnstile solves reliably)
+ * - Turnstile CAPTCHA handling (wait + extract + API bypass)
  * - Multi-profile browser isolation
  * - Parallel workflow execution
  * - Credential substitution ({{key}} syntax)
  * - Configurable retries with VPN switching
- * - CAPTCHA detection (detect only, no bypass)
  * - Screenshot capture on failures
  * - Structured debug telemetry
  */
@@ -22,6 +28,9 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const https = require('https');
 const http = require('http');
+
+// Supabase anon key — embedded in VAPI's frontend JS, not a secret
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp0dXlwcmpqZ3hiZ210aml5a29hIiwicm9sZSI6ImFub24iLCJpYXQiOjE2OTQ2NDQ5OTAsImV4cCI6MjAxMDIyMDk5MH0.TByTGnMGMHB3jT9jLCX51PUune9BuOS-PsdI4FYAJRs';
 
 // Stealth JS injection — runs on every new page
 const STEALTH_INIT_SCRIPT = `
@@ -594,95 +603,51 @@ class WorkflowRunner {
       this.emit('workflow_step', { workflow_id: workflowId, step: 1, action: 'navigate_register', status: 'success' });
       stepsCompleted.push('navigate_register');
 
-      // ─── STEP 2: Fill email and password, click Sign Up ───
-      // Uses page.type() which sends real CDP keyboard events — React's
-      // synthetic event system picks these up naturally (unlike
-      // nativeInputValueSetter which only works in DevTools console).
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'starting' });
+      // ─── STEP 2: Wait for Turnstile + call Supabase signup API ───
+      // VAPI uses Cloudflare Turnstile (invisible CAPTCHA) which keeps the
+      // Sign Up button disabled until it solves. On real Chrome with user
+      // data dir, Turnstile solves in ~2-5s. We extract the token and call
+      // the Supabase signup API directly, bypassing the React form entirely.
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'turnstile_wait', status: 'starting' });
 
-      // Wait for and fill email
-      await waitAndLog('input[name="email"]', 'Email input');
-      await humanType('input[name="email"]', email);
-      await humanDelay(300, 600);
-
-      // Wait for and fill password
-      await waitAndLog('input[name="password"]', 'Password input');
-      await humanType('input[name="password"]', password);
-      await humanDelay(500, 1000);
-
-      // Wait for Sign Up button
-      await waitAndLog('button[type="submit"]', 'Sign Up button');
-
-      // Check button state — with real typing, React should have enabled it
-      const btnInfo = await page.evaluate(() => {
-        const btn = document.querySelector('button[type="submit"]');
-        const emailInput = document.querySelector('input[name="email"]');
-        const passInput = document.querySelector('input[name="password"]');
-        return {
-          text: btn ? btn.textContent.trim() : 'not found',
-          disabled: btn ? btn.disabled : true,
-          emailValue: emailInput ? emailInput.value : '',
-          passLength: passInput ? passInput.value.length : 0,
-        };
-      });
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'clicking_signup', details: btnInfo });
-
-      // If button still disabled, wait a bit for React, then force-enable
-      if (btnInfo.disabled) {
-        await humanDelay(1000, 2000);
-        await page.evaluate(() => {
-          const btn = document.querySelector('button[type="submit"]');
-          if (btn && btn.disabled) { btn.disabled = false; btn.removeAttribute('disabled'); }
-        });
-        await humanDelay(200, 400);
+      // Wait for Turnstile to solve (poll the hidden cf-turnstile-response input)
+      let turnstileToken = null;
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        turnstileToken = await page.evaluate(() => {
+          const cf = document.querySelector('input[name="cf-turnstile-response"]');
+          return cf && cf.value.length > 100 ? cf.value : null;
+        }).catch(() => null);
+        if (turnstileToken) break;
       }
 
-      // Click the Sign Up button using real Puppeteer click (CDP mouse event)
-      await page.click('button[type="submit"]');
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted' });
-
-      // Wait for confirmation page (VAPI is SPA, shows "Confirmation email sent")
-      let confirmed = false;
-      try {
-        await page.waitForFunction(
-          () => document.body.innerText.includes('Confirmation email sent') ||
-                document.body.innerText.includes('Check your inbox') ||
-                !window.location.href.includes('/register'),
-          { timeout: 15000 }
-        );
-        confirmed = true;
-      } catch {
-        const content = await page.content().catch(() => '');
-        confirmed = content.includes('Confirmation') || content.includes('Check your inbox');
+      if (!turnstileToken) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'turnstile_wait', status: 'timeout' });
+        throw new Error('Turnstile CAPTCHA did not solve within 60s');
       }
 
-      // Fallback: press Enter on password field via real CDP keyboard event
-      if (!confirmed && page.url().includes('/register')) {
-        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'retrying_enter' });
-        await page.focus('input[name="password"]');
-        await page.keyboard.press('Enter');
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'turnstile_wait', status: 'solved', details: { token_length: turnstileToken.length } });
 
-        try {
-          await page.waitForFunction(
-            () => document.body.innerText.includes('Confirmation email sent') ||
-                  !window.location.href.includes('/register'),
-            { timeout: 15000 }
-          );
-          confirmed = true;
-        } catch { /* continue anyway */ }
-        await humanDelay(2000, 3000);
+      // Call Supabase signup API directly with the Turnstile token
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'supabase_signup', status: 'starting' });
+
+      const signupResult = await this.httpPostJson('https://auth.vapi.ai/auth/v1/signup', {
+        email,
+        password,
+        gotrue_meta_security: { captcha_token: turnstileToken },
+      }, { 'apikey': SUPABASE_ANON_KEY });
+
+      const needsVerification = !!(signupResult && signupResult.id);
+
+      if (needsVerification) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'supabase_signup', status: 'success', details: { user_id: signupResult.id, needs_verification: true } });
+      } else {
+        const errMsg = signupResult ? (signupResult.msg || signupResult.message || JSON.stringify(signupResult)) : 'No response';
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'supabase_signup', status: 'failed', details: { error: errMsg } });
+        throw new Error(`Signup API failed: ${errMsg}`);
       }
 
-      // Check if we got a confirmation message or redirected to dashboard
-      const currentUrl = page.url();
-      let pageContent = '';
-      try { pageContent = await page.content(); } catch { /* frame may have detached */ }
-      const lowerContent = pageContent.toLowerCase();
-      const needsVerification = lowerContent.includes('confirmation email sent') ||
-                                 lowerContent.includes('check your inbox') ||
-                                 (confirmed && currentUrl.includes('/register'));
-
-      stepsCompleted.push('fill_registration');
+      stepsCompleted.push('signup_api');
       this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'success', details: { needs_verification: needsVerification } });
 
       if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
@@ -719,7 +684,10 @@ class WorkflowRunner {
         this.emit('workflow_step', { workflow_id: workflowId, step: 2.5, action: 'email_verification', status: 'skipped', details: { message: 'No Mailgun API key provided. Email verification must be done manually.' } });
       }
 
-      // ─── STEP 3: Login (if not already on dashboard) ───
+      // ─── STEP 3: Login via Supabase token API ───
+      // Login page also has Turnstile, so we use the same API approach:
+      // navigate to login page → wait for Turnstile → call Supabase token API
+      // → inject auth session into localStorage → reload dashboard
       const afterVerifyUrl = page.url();
       if (!afterVerifyUrl.includes('/composer') && !afterVerifyUrl.includes('/assistants') && !afterVerifyUrl.includes('/settings')) {
         this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'starting' });
@@ -727,60 +695,43 @@ class WorkflowRunner {
         await page.goto('https://dashboard.vapi.ai/login', { waitUntil: 'networkidle2', timeout: 30000 });
         await humanDelay(1000, 2000);
 
-        // Fill login form using real CDP keyboard events (same as registration)
-        await waitAndLog('input[name="email"]', 'Login email');
-        await humanType('input[name="email"]', email);
-        await humanDelay(300, 600);
-
-        await waitAndLog('input[name="password"]', 'Login password');
-        await humanType('input[name="password"]', password);
-        await humanDelay(500, 1000);
-
-        await waitAndLog('button[type="submit"]', 'Sign In button');
-
-        // Check button state
-        const loginBtnDisabled = await page.evaluate(() => {
-          const btn = document.querySelector('button[type="submit"]');
-          return btn ? btn.disabled : true;
-        });
-        if (loginBtnDisabled) {
-          await page.evaluate(() => {
-            const btn = document.querySelector('button[type="submit"]');
-            if (btn) { btn.disabled = false; btn.removeAttribute('disabled'); }
-          });
-          await humanDelay(200, 400);
-        }
-        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'clicked', details: { btnWasDisabled: loginBtnDisabled } });
-
-        // Click Sign In and wait for navigation
-        try {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-            page.click('button[type="submit"]'),
-          ]);
-        } catch (navErr) {
-          this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'nav_redirect', details: { message: navErr.message } });
+        // Wait for Turnstile to solve on login page
+        let loginToken = null;
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 2000));
+          loginToken = await page.evaluate(() => {
+            const cf = document.querySelector('input[name="cf-turnstile-response"]');
+            return cf && cf.value.length > 100 ? cf.value : null;
+          }).catch(() => null);
+          if (loginToken) break;
         }
 
-        // Wait for the SPA to stabilize after redirect
-        await humanDelay(4000, 6000);
+        if (loginToken) {
+          // Call Supabase token API for login
+          const loginResult = await this.httpPostJson(
+            'https://auth.vapi.ai/auth/v1/token?grant_type=password',
+            { email, password, gotrue_meta_security: { captcha_token: loginToken } },
+            { 'apikey': SUPABASE_ANON_KEY }
+          );
 
-        // Ensure page is still usable after redirect — handle frame detach
-        try {
-          await page.waitForFunction(() => document.readyState === 'complete', { timeout: 10000 });
-        } catch (frameErr) {
-          this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'frame_recovery', details: { error: frameErr.message } });
-          // Frame detached — get fresh page from browser and navigate to dashboard
-          try {
-            const pages = await browser.pages();
-            page = pages[pages.length - 1] || page;
+          if (loginResult && loginResult.access_token) {
+            // Inject auth session into localStorage and reload
+            await page.evaluate((authData) => {
+              localStorage.setItem('vapi-supabase-auth', JSON.stringify(authData));
+            }, loginResult);
+
             await page.goto('https://dashboard.vapi.ai/', { waitUntil: 'networkidle2', timeout: 30000 });
-            await humanDelay(2000, 3000);
-          } catch { /* last resort, continue anyway */ }
+            await humanDelay(3000, 5000);
+
+            this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'success', details: { method: 'supabase_token_api' } });
+          } else {
+            this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'failed', details: { error: loginResult ? (loginResult.msg || loginResult.error_description || JSON.stringify(loginResult)) : 'No response' } });
+          }
+        } else {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'failed', details: { error: 'Turnstile did not solve on login page' } });
         }
 
         stepsCompleted.push('login');
-        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'success' });
       } else {
         stepsCompleted.push('login_skipped_already_on_dashboard');
       }
@@ -795,119 +746,56 @@ class WorkflowRunner {
 
       if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
 
-      // ─── STEP 4: Navigate to Billing and apply promo code ───
+      // ─── STEP 4: Apply promo code via VAPI API ───
+      // The coupon dialog is a React controlled component — filling it via
+      // Puppeteer doesn't trigger React state. Instead, we call the VAPI API
+      // directly: GET /org → POST /subscription/{id}/coupon.
       if (promoCode) {
         this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'starting' });
 
-        // Navigate to billing page with coupon dialog
-        await page.goto('https://dashboard.vapi.ai/settings/billing?coupon-redemption=true', {
-          waitUntil: 'networkidle2',
-          timeout: 30000,
-        });
-        await humanDelay(2000, 4000);
-
-        // Wait for the coupon code input to appear
-        const couponInputSelector = 'input[name="code"]';
         try {
-          await page.waitForSelector(couponInputSelector, { timeout: timeoutMs });
-          await humanDelay(500, 1000);
+          // Extract auth token from browser localStorage
+          const authToken = await page.evaluate(() => {
+            const data = localStorage.getItem('vapi-supabase-auth');
+            if (!data) return null;
+            const parsed = JSON.parse(data);
+            return parsed.access_token || null;
+          }).catch(() => null);
 
-          // Type promo code
-          await humanType(couponInputSelector, promoCode);
-          await humanDelay(500, 1000);
-
-          // Find and click the Redeem button
-          const redeemClicked = await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const redeemBtn = buttons.find(b => b.textContent.trim() === 'Redeem');
-            if (redeemBtn) {
-              redeemBtn.click();
-              return true;
-            }
-            return false;
-          });
-
-          if (redeemClicked) {
-            await humanDelay(3000, 5000);
-
-            // Check credit balance
-            const creditBalance = await page.evaluate(() => {
-              const text = document.body.innerText;
-              const match = text.match(/(\d+(?:\.\d+)?)\s*Credits/);
-              return match ? match[1] : null;
-            });
-
-            stepsCompleted.push('promo_applied');
-            this.emit('workflow_step', {
-              workflow_id: workflowId,
-              step: 4,
-              action: 'apply_promo',
-              status: 'success',
-              details: { promo_code: promoCode, credit_balance: creditBalance },
-            });
+          if (!authToken) {
+            this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'failed', details: { message: 'No auth token in localStorage' } });
           } else {
-            // Try clicking Apply Coupon button first, then fill
-            const applyCouponClicked = await page.evaluate(() => {
-              const buttons = Array.from(document.querySelectorAll('button'));
-              const applyBtn = buttons.find(b => b.textContent.trim() === 'Apply Coupon');
-              if (applyBtn) {
-                applyBtn.click();
-                return true;
+            // Get org data to find subscriptionId
+            const orgData = await this.httpGetJson('https://api.vapi.ai/org', { 'Authorization': `Bearer ${authToken}` });
+            const org = Array.isArray(orgData) ? orgData[0] : orgData;
+            const subId = org ? org.subscriptionId : null;
+            const orgId = org ? org.id : null;
+
+            if (subId && orgId) {
+              // Apply coupon via API
+              const couponResult = await this.httpPostJson(
+                `https://api.vapi.ai/subscription/${subId}/coupon`,
+                { couponCode: promoCode, orgId },
+                { 'Authorization': `Bearer ${authToken}` }
+              );
+
+              const newCredits = couponResult ? couponResult.credits : null;
+              if (newCredits && parseFloat(newCredits) > 10) {
+                stepsCompleted.push('promo_applied');
+                this.emit('workflow_step', {
+                  workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'success',
+                  details: { promo_code: promoCode, credits: newCredits },
+                });
+              } else {
+                const errMsg = couponResult ? (couponResult.message || couponResult.msg || JSON.stringify(couponResult)) : 'No response';
+                this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'failed', details: { error: errMsg } });
               }
-              return false;
-            });
-
-            if (applyCouponClicked) {
-              await humanDelay(1000, 2000);
-              await page.waitForSelector(couponInputSelector, { timeout: timeoutMs });
-              await humanType(couponInputSelector, promoCode);
-              await humanDelay(500, 1000);
-
-              await page.evaluate(() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const redeemBtn = buttons.find(b => b.textContent.trim() === 'Redeem');
-                if (redeemBtn) redeemBtn.click();
-              });
-              await humanDelay(3000, 5000);
-              stepsCompleted.push('promo_applied');
-              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'success' });
             } else {
-              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'failed', details: { message: 'Could not find Redeem or Apply Coupon button' } });
+              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'failed', details: { message: 'No subscription/org found' } });
             }
           }
         } catch (err) {
-          // Coupon dialog might not have opened. Try clicking Apply Coupon button first.
-          this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'retrying', details: { message: 'Coupon input not found, trying Apply Coupon button' } });
-
-          await page.goto('https://dashboard.vapi.ai/settings/billing', { waitUntil: 'networkidle2', timeout: 30000 });
-          await humanDelay(2000, 3000);
-
-          const applyCouponClicked = await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const applyBtn = buttons.find(b => b.textContent.trim() === 'Apply Coupon');
-            if (applyBtn) { applyBtn.click(); return true; }
-            return false;
-          });
-
-          if (applyCouponClicked) {
-            await humanDelay(1000, 2000);
-            try {
-              await page.waitForSelector(couponInputSelector, { timeout: timeoutMs });
-              await humanType(couponInputSelector, promoCode);
-              await humanDelay(500, 1000);
-
-              await page.evaluate(() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const redeemBtn = buttons.find(b => b.textContent.trim() === 'Redeem');
-                if (redeemBtn) redeemBtn.click();
-              });
-              await humanDelay(3000, 5000);
-              stepsCompleted.push('promo_applied');
-              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'success' });
-            } catch (innerErr) {
-              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'failed', details: { error: innerErr.message } });
-            }
-          }
+          this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'failed', details: { error: err.message } });
         }
       } else {
         this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'skipped', details: { message: 'No promo code provided' } });
@@ -1450,6 +1338,64 @@ class WorkflowRunner {
       req.on('error', reject);
       req.setTimeout(10000, () => { req.destroy(); reject(new Error('Request timeout')); });
       req.write(body);
+      req.end();
+    });
+  }
+
+  httpPostJson(url, body, extraHeaders = {}) {
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const mod = parsedUrl.protocol === 'https:' ? https : http;
+      const jsonBody = JSON.stringify(body);
+
+      const reqOptions = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(jsonBody),
+          ...extraHeaders,
+        },
+      };
+
+      const req = mod.request(reqOptions, (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); } catch { resolve({ raw: data, statusCode: res.statusCode }); }
+        });
+      });
+
+      req.on('error', reject);
+      req.setTimeout(15000, () => { req.destroy(); reject(new Error('Request timeout')); });
+      req.write(jsonBody);
+      req.end();
+    });
+  }
+
+  httpGetJson(url, extraHeaders = {}) {
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const mod = parsedUrl.protocol === 'https:' ? https : http;
+
+      const reqOptions = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: 'GET',
+        headers: { ...extraHeaders },
+      };
+
+      const req = mod.request(reqOptions, (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); } catch { resolve({ raw: data, statusCode: res.statusCode }); }
+        });
+      });
+
+      req.on('error', reject);
+      req.setTimeout(15000, () => { req.destroy(); reject(new Error('Request timeout')); });
       req.end();
     });
   }
