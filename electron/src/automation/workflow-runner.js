@@ -566,18 +566,29 @@ class WorkflowRunner {
       await humanType('input[name="password"]', password);
       await humanDelay(500, 1000);
 
-      // Click Sign Up button
+      // Click Sign Up button — wait for it to become enabled first
       const signUpSelector = 'button[type="submit"]';
       await waitAndLog(signUpSelector, 'Sign Up button');
+
+      // Wait until the button is not disabled (form validation)
+      await page.waitForFunction(() => {
+        const btn = document.querySelector('button[type="submit"]');
+        return btn && !btn.disabled;
+      }, { timeout: timeoutMs });
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'button_enabled' });
+
+      await humanDelay(300, 600);
       await page.click(signUpSelector);
       this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted' });
 
-      // Wait for confirmation message or redirect
-      await humanDelay(3000, 5000);
+      // Wait for page change (confirmation message or redirect)
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+      await humanDelay(2000, 3000);
 
       // Check if we got a confirmation message or redirected to dashboard
       const currentUrl = page.url();
-      const pageContent = await page.content();
+      let pageContent = '';
+      try { pageContent = await page.content(); } catch { /* frame may have detached */ }
       const needsVerification = pageContent.toLowerCase().includes('confirmation') ||
                                  pageContent.toLowerCase().includes('verify') ||
                                  pageContent.toLowerCase().includes('check your') ||
@@ -585,6 +596,8 @@ class WorkflowRunner {
 
       stepsCompleted.push('fill_registration');
       this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'success', details: { needs_verification: needsVerification } });
+
+      if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
 
       // ─── STEP 2.5: Email verification ───
       if (needsVerification && mailgunApiKey && mailgunDomain) {
@@ -594,6 +607,7 @@ class WorkflowRunner {
         let verificationLink = null;
         const maxAttempts = 12;
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          if (this.stopped) break;
           this.emit('workflow_step', { workflow_id: workflowId, step: 2.5, action: 'email_verification', status: 'polling', details: { attempt: attempt + 1, max: maxAttempts } });
 
           verificationLink = await this.fetchVerificationLink(mailgunApiKey, mailgunDomain, email);
@@ -634,13 +648,38 @@ class WorkflowRunner {
         await humanType('input[name="password"]', password);
         await humanDelay(500, 1000);
 
-        // Click Sign In
+        // Wait for Sign In button to be enabled
         await waitAndLog('button[type="submit"]', 'Sign In button');
-        await page.click('button[type="submit"]');
+        await page.waitForFunction(() => {
+          const btn = document.querySelector('button[type="submit"]');
+          return btn && !btn.disabled;
+        }, { timeout: timeoutMs });
+        await humanDelay(300, 600);
 
-        // Wait for dashboard to load
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-        await humanDelay(3000, 5000);
+        // Click Sign In and handle navigation (VAPI does client-side redirect)
+        try {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
+            page.click('button[type="submit"]'),
+          ]);
+        } catch (navErr) {
+          // Frame detachment during navigation is expected for SPA redirects
+          this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'nav_redirect', details: { message: navErr.message } });
+        }
+
+        // Wait for the SPA to stabilize after redirect
+        await humanDelay(4000, 6000);
+
+        // Ensure page is still usable after redirect
+        try {
+          await page.waitForFunction(() => document.readyState === 'complete', { timeout: 10000 });
+        } catch {
+          // If frame detached, navigate directly to dashboard to get a fresh page state
+          try {
+            await page.goto('https://dashboard.vapi.ai/', { waitUntil: 'networkidle2', timeout: 30000 });
+            await humanDelay(2000, 3000);
+          } catch { /* last resort, continue anyway */ }
+        }
 
         stepsCompleted.push('login');
         this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'success' });
@@ -649,8 +688,14 @@ class WorkflowRunner {
       }
 
       // ─── STEP 3.5: Handle onboarding survey (if present) ───
-      await this.handleVapiOnboarding(page, workflowId);
+      try {
+        await this.handleVapiOnboarding(page, workflowId);
+      } catch (onboardErr) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'onboarding_survey', status: 'error', details: { error: onboardErr.message } });
+      }
       stepsCompleted.push('onboarding_handled');
+
+      if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
 
       // ─── STEP 4: Navigate to Billing and apply promo code ───
       if (promoCode) {
@@ -930,23 +975,27 @@ class WorkflowRunner {
     // Fetch stored messages from Mailgun to find the VAPI verification link
     // The API key and domain are provided by the user at runtime — never hardcoded
     try {
+      // Try events API first (works when routes have store() action)
       const url = `https://api.mailgun.net/v3/${domain}/events?event=stored&recipient=${encodeURIComponent(email)}&limit=5`;
+
+      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'querying_events', details: { endpoint: 'events', email } });
 
       const response = await this.httpGet(url, {
         auth: `api:${apiKey}`,
       });
 
-      if (response && response.items) {
+      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'events_response', details: { items_count: response && response.items ? response.items.length : 0 } });
+
+      if (response && response.items && response.items.length > 0) {
         for (const item of response.items) {
           if (item.storage && item.storage.url) {
-            // Fetch the stored message
+            // Fetch the stored message content from the storage URL
             const message = await this.httpGet(item.storage.url, {
               auth: `api:${apiKey}`,
             });
 
             if (message && message['body-html']) {
-              // Extract verification link from HTML
-              const linkMatch = message['body-html'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s]+/);
+              const linkMatch = message['body-html'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s<]+/);
               if (linkMatch) {
                 return linkMatch[0].replace(/&amp;/g, '&');
               }
@@ -961,18 +1010,34 @@ class WorkflowRunner {
         }
       }
 
-      // Alternative: try stored messages endpoint
-      const storedUrl = `https://api.mailgun.net/v3/${domain}/messages?recipient=${encodeURIComponent(email)}&limit=5`;
-      const storedResponse = await this.httpGet(storedUrl, {
-        auth: `api:${apiKey}`,
-      });
+      // Fallback: try events with "accepted" event type (received emails)
+      const acceptedUrl = `https://api.mailgun.net/v3/${domain}/events?event=accepted&recipient=${encodeURIComponent(email)}&limit=5`;
+      const acceptedResponse = await this.httpGet(acceptedUrl, { auth: `api:${apiKey}` });
 
-      if (storedResponse && storedResponse.items) {
-        for (const item of storedResponse.items) {
-          const body = item['body-html'] || item['body-plain'] || '';
-          const linkMatch = body.match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s]+/);
-          if (linkMatch) {
-            return linkMatch[0].replace(/&amp;/g, '&');
+      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'accepted_response', details: { items_count: acceptedResponse && acceptedResponse.items ? acceptedResponse.items.length : 0 } });
+
+      // Fallback: Query all recent events for this recipient
+      const allEventsUrl = `https://api.mailgun.net/v3/${domain}/events?recipient=${encodeURIComponent(email)}&limit=10`;
+      const allEvents = await this.httpGet(allEventsUrl, { auth: `api:${apiKey}` });
+
+      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'all_events_response', details: {
+        items_count: allEvents && allEvents.items ? allEvents.items.length : 0,
+        event_types: allEvents && allEvents.items ? allEvents.items.map(i => i.event).filter(Boolean) : [],
+      }});
+
+      // Check if any event has storage URL
+      if (allEvents && allEvents.items) {
+        for (const item of allEvents.items) {
+          if (item.storage && item.storage.url) {
+            const message = await this.httpGet(item.storage.url, { auth: `api:${apiKey}` });
+            if (message && message['body-html']) {
+              const linkMatch = message['body-html'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s<]+/);
+              if (linkMatch) return linkMatch[0].replace(/&amp;/g, '&');
+            }
+            if (message && message['body-plain']) {
+              const linkMatch = message['body-plain'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^\s]+/);
+              if (linkMatch) return linkMatch[0];
+            }
           }
         }
       }

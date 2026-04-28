@@ -160,6 +160,9 @@ ipcMain.handle('app:getChromiumPath', () => {
   return app.getPath('exe');
 });
 
+// Active workflow runner reference (for stop support)
+let activeRunner = null;
+
 // Run workflow
 ipcMain.handle('workflow:run', async (event, params) => {
   const { WorkflowRunner } = require('../automation/workflow-runner');
@@ -220,17 +223,23 @@ ipcMain.handle('workflow:run', async (event, params) => {
     },
   });
 
+  activeRunner = runner;
+
   try {
     const results = await runner.execute(params);
     return { success: true, results };
   } catch (err) {
     return { success: false, error: err.message };
+  } finally {
+    activeRunner = null;
   }
 });
 
 // Stop workflow
 ipcMain.handle('workflow:stop', async () => {
-  // Signal to stop
+  if (activeRunner) {
+    activeRunner.stop();
+  }
   return { stopped: true };
 });
 
