@@ -322,7 +322,7 @@ class WorkflowRunner {
     });
 
     try {
-      const page = (await browser.pages())[0] || await browser.newPage();
+      let page = (await browser.pages())[0] || await browser.newPage();
 
       // Inject stealth script
       await page.evaluateOnNewDocument(STEALTH_INIT_SCRIPT);
@@ -565,33 +565,21 @@ class WorkflowRunner {
       return new Promise(r => setTimeout(r, ms));
     };
 
-    // Helper: fill input using nativeInputValueSetter (React-compatible)
-    // This is proven to work on VAPI's React controlled form — tested directly
-    // in Chrome. Character-by-character typing conflicts with React's state
-    // management on controlled components, so we use the native setter instead.
+    // Helper: fill input using page.type() which sends real CDP keyboard events.
+    // This is the only reliable way to fill React controlled inputs — it goes
+    // through the browser's native event pipeline (keydown/keypress/input/keyup)
+    // which React's synthetic event system picks up naturally.
+    // nativeInputValueSetter + _valueTracker only works in DevTools console,
+    // not from Puppeteer's page.evaluate() context.
     const humanType = async (selector, text) => {
-      await page.click(selector); // focus the input
+      await page.click(selector, { clickCount: 3 }); // focus + select all existing text
+      await humanDelay(100, 300);
+
+      // Use real CDP keyboard events with a small delay between chars
+      // to let React process each keystroke's onChange handler
+      await page.type(selector, text, { delay: 20 });
+
       await humanDelay(200, 500);
-
-      // Use nativeInputValueSetter + _valueTracker reset — this is the proven
-      // technique for React controlled components. The _valueTracker reset is
-      // critical: React caches the last value internally, and without resetting
-      // the tracker, React's comparison sees no change and ignores the event.
-      await page.evaluate((sel, val) => {
-        const input = document.querySelector(sel);
-        if (!input) return;
-        const nativeSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, 'value'
-        ).set;
-        nativeSetter.call(input, val);
-        // Reset React's internal value tracker so it detects the change
-        const tracker = input._valueTracker;
-        if (tracker) tracker.setValue('');
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }, selector, text);
-
-      await humanDelay(300, 700);
     };
 
     try {
@@ -607,81 +595,53 @@ class WorkflowRunner {
       stepsCompleted.push('navigate_register');
 
       // ─── STEP 2: Fill email and password, click Sign Up ───
-      // CRITICAL: Everything must happen in a SINGLE page.evaluate() call.
-      // Splitting across multiple evaluate/click calls causes timing issues
-      // with React's state management on controlled components.
+      // Uses page.type() which sends real CDP keyboard events — React's
+      // synthetic event system picks these up naturally (unlike
+      // nativeInputValueSetter which only works in DevTools console).
       this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'starting' });
 
-      // Wait for form elements to be present
+      // Wait for and fill email
       await waitAndLog('input[name="email"]', 'Email input');
+      await humanType('input[name="email"]', email);
+      await humanDelay(300, 600);
+
+      // Wait for and fill password
       await waitAndLog('input[name="password"]', 'Password input');
+      await humanType('input[name="password"]', password);
+      await humanDelay(500, 1000);
+
+      // Wait for Sign Up button
       await waitAndLog('button[type="submit"]', 'Sign Up button');
 
-      // Fill both fields and click Sign Up — all in ONE evaluate call.
-      // This matches the exact sequence that was proven to work in Chrome
-      // DevTools console on dashboard.vapi.ai/register.
-      const fillResult = await page.evaluate(async (emailVal, passVal) => {
-        const result = { emailSet: false, passSet: false, btnClicked: false };
-
-        function setReactValue(input, value) {
-          input.focus();
-          const nativeSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-          ).set;
-          nativeSetter.call(input, value);
-          const tracker = input._valueTracker;
-          if (tracker) tracker.setValue('');
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-
+      // Check button state — with real typing, React should have enabled it
+      const btnInfo = await page.evaluate(() => {
+        const btn = document.querySelector('button[type="submit"]');
         const emailInput = document.querySelector('input[name="email"]');
         const passInput = document.querySelector('input[name="password"]');
-        const btn = document.querySelector('button[type="submit"]');
+        return {
+          text: btn ? btn.textContent.trim() : 'not found',
+          disabled: btn ? btn.disabled : true,
+          emailValue: emailInput ? emailInput.value : '',
+          passLength: passInput ? passInput.value.length : 0,
+        };
+      });
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'clicking_signup', details: btnInfo });
 
-        if (!emailInput || !passInput || !btn) {
-          result.error = 'Elements not found';
-          return result;
-        }
+      // If button still disabled, wait a bit for React, then force-enable
+      if (btnInfo.disabled) {
+        await humanDelay(1000, 2000);
+        await page.evaluate(() => {
+          const btn = document.querySelector('button[type="submit"]');
+          if (btn && btn.disabled) { btn.disabled = false; btn.removeAttribute('disabled'); }
+        });
+        await humanDelay(200, 400);
+      }
 
-        // Set email
-        setReactValue(emailInput, emailVal);
-        result.emailSet = true;
-        result.emailValue = emailInput.value;
+      // Click the Sign Up button using real Puppeteer click (CDP mouse event)
+      await page.click('button[type="submit"]');
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted' });
 
-        // Set password
-        setReactValue(passInput, passVal);
-        result.passSet = true;
-        result.passLength = passInput.value.length;
-
-        // Wait for React to process state updates and re-render
-        await new Promise(r => setTimeout(r, 500));
-
-        result.btnDisabledAfterFill = btn.disabled;
-
-        // If button is still disabled, force-enable it
-        if (btn.disabled) {
-          btn.disabled = false;
-          btn.removeAttribute('disabled');
-          result.forceEnabled = true;
-        }
-
-        // Click the button
-        btn.click();
-        result.btnClicked = true;
-
-        // Also try form.requestSubmit() as backup
-        const form = btn.closest('form');
-        if (form) {
-          try { form.requestSubmit(btn); } catch(e) { result.requestSubmitError = e.message; }
-        }
-
-        return result;
-      }, email, password);
-
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'clicking_signup', details: fillResult });
-
-      // Wait for confirmation page (VAPI shows "Confirmation email sent" without full nav)
+      // Wait for confirmation page (VAPI is SPA, shows "Confirmation email sent")
       let confirmed = false;
       try {
         await page.waitForFunction(
@@ -696,51 +656,11 @@ class WorkflowRunner {
         confirmed = content.includes('Confirmation') || content.includes('Check your inbox');
       }
 
-      // Fallback: try Enter key on password field, then direct form submission
+      // Fallback: press Enter on password field via real CDP keyboard event
       if (!confirmed && page.url().includes('/register')) {
         this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'retrying_enter' });
-
-        // Re-fill and submit via a fresh evaluate with Enter key simulation
-        const retryResult = await page.evaluate(async (emailVal, passVal) => {
-          function setReactValue(input, value) {
-            input.focus();
-            const nativeSetter = Object.getOwnPropertyDescriptor(
-              window.HTMLInputElement.prototype, 'value'
-            ).set;
-            nativeSetter.call(input, value);
-            const tracker = input._valueTracker;
-            if (tracker) tracker.setValue('');
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-
-          const emailInput = document.querySelector('input[name="email"]');
-          const passInput = document.querySelector('input[name="password"]');
-
-          if (emailInput && passInput) {
-            setReactValue(emailInput, emailVal);
-            setReactValue(passInput, passVal);
-            await new Promise(r => setTimeout(r, 500));
-          }
-
-          // Try submitting via Enter key event on password
-          if (passInput) {
-            passInput.focus();
-            passInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-            passInput.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-            passInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-          }
-
-          // Also try form submit event
-          const form = document.querySelector('form');
-          if (form) {
-            const submitEvt = new Event('submit', { bubbles: true, cancelable: true });
-            form.dispatchEvent(submitEvt);
-          }
-
-          return { retried: true };
-        }, email, password);
-        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'retry_result', details: retryResult });
+        await page.focus('input[name="password"]');
+        await page.keyboard.press('Enter');
 
         try {
           await page.waitForFunction(
@@ -807,49 +727,37 @@ class WorkflowRunner {
         await page.goto('https://dashboard.vapi.ai/login', { waitUntil: 'networkidle2', timeout: 30000 });
         await humanDelay(1000, 2000);
 
-        // Fill login form and click — single evaluate for React compatibility
+        // Fill login form using real CDP keyboard events (same as registration)
         await waitAndLog('input[name="email"]', 'Login email');
+        await humanType('input[name="email"]', email);
+        await humanDelay(300, 600);
+
         await waitAndLog('input[name="password"]', 'Login password');
+        await humanType('input[name="password"]', password);
+        await humanDelay(500, 1000);
+
         await waitAndLog('button[type="submit"]', 'Sign In button');
 
-        const loginResult = await page.evaluate(async (emailVal, passVal) => {
-          function setReactValue(input, value) {
-            input.focus();
-            const nativeSetter = Object.getOwnPropertyDescriptor(
-              window.HTMLInputElement.prototype, 'value'
-            ).set;
-            nativeSetter.call(input, value);
-            const tracker = input._valueTracker;
-            if (tracker) tracker.setValue('');
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-
-          const emailInput = document.querySelector('input[name="email"]');
-          const passInput = document.querySelector('input[name="password"]');
+        // Check button state
+        const loginBtnDisabled = await page.evaluate(() => {
           const btn = document.querySelector('button[type="submit"]');
+          return btn ? btn.disabled : true;
+        });
+        if (loginBtnDisabled) {
+          await page.evaluate(() => {
+            const btn = document.querySelector('button[type="submit"]');
+            if (btn) { btn.disabled = false; btn.removeAttribute('disabled'); }
+          });
+          await humanDelay(200, 400);
+        }
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'clicked', details: { btnWasDisabled: loginBtnDisabled } });
 
-          if (!emailInput || !passInput || !btn) return { error: 'Elements not found' };
-
-          setReactValue(emailInput, emailVal);
-          setReactValue(passInput, passVal);
-
-          await new Promise(r => setTimeout(r, 500));
-
-          const btnWasDisabled = btn.disabled;
-          if (btn.disabled) {
-            btn.disabled = false;
-            btn.removeAttribute('disabled');
-          }
-          btn.click();
-
-          return { emailSet: true, passSet: true, btnClicked: true, btnWasDisabled };
-        }, email, password);
-        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'clicked', details: loginResult });
-
-        // Wait for navigation after login
+        // Click Sign In and wait for navigation
         try {
-          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
+            page.click('button[type="submit"]'),
+          ]);
         } catch (navErr) {
           this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'nav_redirect', details: { message: navErr.message } });
         }
@@ -857,12 +765,15 @@ class WorkflowRunner {
         // Wait for the SPA to stabilize after redirect
         await humanDelay(4000, 6000);
 
-        // Ensure page is still usable after redirect
+        // Ensure page is still usable after redirect — handle frame detach
         try {
           await page.waitForFunction(() => document.readyState === 'complete', { timeout: 10000 });
-        } catch {
-          // If frame detached, navigate directly to dashboard to get a fresh page state
+        } catch (frameErr) {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'frame_recovery', details: { error: frameErr.message } });
+          // Frame detached — get fresh page from browser and navigate to dashboard
           try {
+            const pages = await browser.pages();
+            page = pages[pages.length - 1] || page;
             await page.goto('https://dashboard.vapi.ai/', { waitUntil: 'networkidle2', timeout: 30000 });
             await humanDelay(2000, 3000);
           } catch { /* last resort, continue anyway */ }
