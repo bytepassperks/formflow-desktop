@@ -566,20 +566,23 @@ class WorkflowRunner {
       await humanType('input[name="password"]', password);
       await humanDelay(500, 1000);
 
-      // Click Sign Up button — wait for it to become enabled first
+      // Click Sign Up button
       const signUpSelector = 'button[type="submit"]';
       await waitAndLog(signUpSelector, 'Sign Up button');
+      await humanDelay(500, 1000);
 
-      // Wait until the button is not disabled (form validation)
-      await page.waitForFunction(() => {
+      // Click the button directly using evaluate (more reliable than page.click)
+      const signUpClicked = await page.evaluate(() => {
         const btn = document.querySelector('button[type="submit"]');
-        return btn && !btn.disabled;
-      }, { timeout: timeoutMs });
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'button_enabled' });
-
-      await humanDelay(300, 600);
-      await page.click(signUpSelector);
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted' });
+        if (btn) {
+          btn.scrollIntoView();
+          btn.focus();
+          btn.click();
+          return { clicked: true, text: btn.textContent.trim(), disabled: btn.disabled };
+        }
+        return { clicked: false };
+      });
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted', details: signUpClicked });
 
       // Wait for page change (confirmation message or redirect)
       await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
@@ -648,22 +651,20 @@ class WorkflowRunner {
         await humanType('input[name="password"]', password);
         await humanDelay(500, 1000);
 
-        // Wait for Sign In button to be enabled
+        // Click Sign In button
         await waitAndLog('button[type="submit"]', 'Sign In button');
-        await page.waitForFunction(() => {
-          const btn = document.querySelector('button[type="submit"]');
-          return btn && !btn.disabled;
-        }, { timeout: timeoutMs });
-        await humanDelay(300, 600);
+        await humanDelay(500, 1000);
 
-        // Click Sign In and handle navigation (VAPI does client-side redirect)
+        // Click using evaluate for reliability
+        await page.evaluate(() => {
+          const btn = document.querySelector('button[type="submit"]');
+          if (btn) { btn.scrollIntoView(); btn.focus(); btn.click(); }
+        });
+
+        // Wait for navigation (VAPI does client-side redirect)
         try {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-            page.click('button[type="submit"]'),
-          ]);
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
         } catch (navErr) {
-          // Frame detachment during navigation is expected for SPA redirects
           this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'nav_redirect', details: { message: navErr.message } });
         }
 
