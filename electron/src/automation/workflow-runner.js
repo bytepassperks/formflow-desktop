@@ -283,7 +283,7 @@ class WorkflowRunner {
       executablePath: execPath,
       userDataDir: profilePath,
       headless: false,
-      ignoreDefaultFlags: true,
+      ignoreDefaultArgs: ['--enable-automation'],
       ignoreHTTPSErrors: true,
       args: [
         '--no-sandbox',
@@ -607,55 +607,81 @@ class WorkflowRunner {
       stepsCompleted.push('navigate_register');
 
       // ─── STEP 2: Fill email and password, click Sign Up ───
+      // CRITICAL: Everything must happen in a SINGLE page.evaluate() call.
+      // Splitting across multiple evaluate/click calls causes timing issues
+      // with React's state management on controlled components.
       this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'starting' });
 
-      // Wait for the email input
+      // Wait for form elements to be present
       await waitAndLog('input[name="email"]', 'Email input');
-      await humanType('input[name="email"]', email);
-      await humanDelay(300, 600);
-
-      // Fill password
       await waitAndLog('input[name="password"]', 'Password input');
-      await humanType('input[name="password"]', password);
-      await humanDelay(500, 1000);
+      await waitAndLog('button[type="submit"]', 'Sign Up button');
 
-      // Click Sign Up button
-      const signUpSelector = 'button[type="submit"]';
-      await waitAndLog(signUpSelector, 'Sign Up button');
+      // Fill both fields and click Sign Up — all in ONE evaluate call.
+      // This matches the exact sequence that was proven to work in Chrome
+      // DevTools console on dashboard.vapi.ai/register.
+      const fillResult = await page.evaluate(async (emailVal, passVal) => {
+        const result = { emailSet: false, passSet: false, btnClicked: false };
 
-      // Wait for React to enable the button after nativeInputValueSetter updated state
-      // If fields are properly set, React will enable the button within ~1s
-      let btnEnabled = false;
-      for (let i = 0; i < 10; i++) {
-        const isDisabled = await page.evaluate(() => {
-          const btn = document.querySelector('button[type="submit"]');
-          return btn ? btn.disabled : true;
-        });
-        if (!isDisabled) { btnEnabled = true; break; }
-        await new Promise(r => setTimeout(r, 500));
-      }
+        function setReactValue(input, value) {
+          input.focus();
+          const nativeSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          ).set;
+          nativeSetter.call(input, value);
+          const tracker = input._valueTracker;
+          if (tracker) tracker.setValue('');
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
 
-      const btnInfo = await page.evaluate(() => {
+        const emailInput = document.querySelector('input[name="email"]');
+        const passInput = document.querySelector('input[name="password"]');
         const btn = document.querySelector('button[type="submit"]');
-        return btn ? { text: btn.textContent.trim(), disabled: btn.disabled } : null;
-      });
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'clicking_signup', details: { ...btnInfo, waited_for_enable: !btnEnabled } });
 
-      // If still disabled after waiting, force-enable as last resort
-      if (!btnEnabled) {
-        await page.evaluate(() => {
-          const btn = document.querySelector('button[type="submit"]');
-          if (btn) { btn.disabled = false; btn.removeAttribute('disabled'); }
-        });
-        await humanDelay(200, 400);
-      }
+        if (!emailInput || !passInput || !btn) {
+          result.error = 'Elements not found';
+          return result;
+        }
 
-      // Click the button and also submit the form directly via JS as backup
-      await page.click(signUpSelector);
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted' });
+        // Set email
+        setReactValue(emailInput, emailVal);
+        result.emailSet = true;
+        result.emailValue = emailInput.value;
+
+        // Set password
+        setReactValue(passInput, passVal);
+        result.passSet = true;
+        result.passLength = passInput.value.length;
+
+        // Wait for React to process state updates and re-render
+        await new Promise(r => setTimeout(r, 500));
+
+        result.btnDisabledAfterFill = btn.disabled;
+
+        // If button is still disabled, force-enable it
+        if (btn.disabled) {
+          btn.disabled = false;
+          btn.removeAttribute('disabled');
+          result.forceEnabled = true;
+        }
+
+        // Click the button
+        btn.click();
+        result.btnClicked = true;
+
+        // Also try form.requestSubmit() as backup
+        const form = btn.closest('form');
+        if (form) {
+          try { form.requestSubmit(btn); } catch(e) { result.requestSubmitError = e.message; }
+        }
+
+        return result;
+      }, email, password);
+
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'clicking_signup', details: fillResult });
 
       // Wait for confirmation page (VAPI shows "Confirmation email sent" without full nav)
-      // Use waitForSelector instead of waitForNavigation since VAPI is a SPA
       let confirmed = false;
       try {
         await page.waitForFunction(
@@ -666,22 +692,63 @@ class WorkflowRunner {
         );
         confirmed = true;
       } catch {
-        // If waitForFunction fails, check current state
         const content = await page.content().catch(() => '');
         confirmed = content.includes('Confirmation') || content.includes('Check your inbox');
       }
 
-      // If not confirmed, try pressing Enter on password field as fallback
+      // Fallback: try Enter key on password field, then direct form submission
       if (!confirmed && page.url().includes('/register')) {
         this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'retrying_enter' });
-        await page.focus('input[name="password"]');
-        await page.keyboard.press('Enter');
+
+        // Re-fill and submit via a fresh evaluate with Enter key simulation
+        const retryResult = await page.evaluate(async (emailVal, passVal) => {
+          function setReactValue(input, value) {
+            input.focus();
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            ).set;
+            nativeSetter.call(input, value);
+            const tracker = input._valueTracker;
+            if (tracker) tracker.setValue('');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+
+          const emailInput = document.querySelector('input[name="email"]');
+          const passInput = document.querySelector('input[name="password"]');
+
+          if (emailInput && passInput) {
+            setReactValue(emailInput, emailVal);
+            setReactValue(passInput, passVal);
+            await new Promise(r => setTimeout(r, 500));
+          }
+
+          // Try submitting via Enter key event on password
+          if (passInput) {
+            passInput.focus();
+            passInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+            passInput.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+            passInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+          }
+
+          // Also try form submit event
+          const form = document.querySelector('form');
+          if (form) {
+            const submitEvt = new Event('submit', { bubbles: true, cancelable: true });
+            form.dispatchEvent(submitEvt);
+          }
+
+          return { retried: true };
+        }, email, password);
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'retry_result', details: retryResult });
+
         try {
           await page.waitForFunction(
             () => document.body.innerText.includes('Confirmation email sent') ||
                   !window.location.href.includes('/register'),
             { timeout: 15000 }
           );
+          confirmed = true;
         } catch { /* continue anyway */ }
         await humanDelay(2000, 3000);
       }
@@ -740,32 +807,49 @@ class WorkflowRunner {
         await page.goto('https://dashboard.vapi.ai/login', { waitUntil: 'networkidle2', timeout: 30000 });
         await humanDelay(1000, 2000);
 
-        // Fill login form
+        // Fill login form and click — single evaluate for React compatibility
         await waitAndLog('input[name="email"]', 'Login email');
-        await humanType('input[name="email"]', email);
-        await humanDelay(300, 600);
-
         await waitAndLog('input[name="password"]', 'Login password');
-        await humanType('input[name="password"]', password);
-        await humanDelay(500, 1000);
-
-        // Click Sign In button
         await waitAndLog('button[type="submit"]', 'Sign In button');
-        await humanDelay(500, 1000);
 
-        // Force-enable if disabled
-        await page.evaluate(() => {
+        const loginResult = await page.evaluate(async (emailVal, passVal) => {
+          function setReactValue(input, value) {
+            input.focus();
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            ).set;
+            nativeSetter.call(input, value);
+            const tracker = input._valueTracker;
+            if (tracker) tracker.setValue('');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+
+          const emailInput = document.querySelector('input[name="email"]');
+          const passInput = document.querySelector('input[name="password"]');
           const btn = document.querySelector('button[type="submit"]');
-          if (btn && btn.disabled) { btn.disabled = false; btn.removeAttribute('disabled'); }
-        });
-        await humanDelay(200, 400);
 
-        // Use page.click() for real mouse simulation, with navigation wait
+          if (!emailInput || !passInput || !btn) return { error: 'Elements not found' };
+
+          setReactValue(emailInput, emailVal);
+          setReactValue(passInput, passVal);
+
+          await new Promise(r => setTimeout(r, 500));
+
+          const btnWasDisabled = btn.disabled;
+          if (btn.disabled) {
+            btn.disabled = false;
+            btn.removeAttribute('disabled');
+          }
+          btn.click();
+
+          return { emailSet: true, passSet: true, btnClicked: true, btnWasDisabled };
+        }, email, password);
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'clicked', details: loginResult });
+
+        // Wait for navigation after login
         try {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-            page.click('button[type="submit"]'),
-          ]);
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
         } catch (navErr) {
           this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'nav_redirect', details: { message: navErr.message } });
         }
