@@ -994,20 +994,27 @@ class WorkflowRunner {
   }
 
   async fetchVerificationLink(apiKey, domain, email) {
-    // Fetch stored messages from Mailgun to find the VAPI verification link
-    // The API key and domain are provided by the user at runtime — never hardcoded
+    // Fetch verification link from the email relay service (primary)
+    // Falls back to Mailgun stored messages API if relay is unavailable
     try {
-      // Try events API first (works when routes have store() action)
+      const RELAY_URL = 'https://mailgun-relay-gvqahkir.fly.dev';
+
+      // Primary: query the email relay for the verification link
+      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'querying_relay', details: { email } });
+
+      const relayResponse = await this.httpGet(`${RELAY_URL}/verify-link/${encodeURIComponent(email)}`);
+
+      if (relayResponse && relayResponse.found && relayResponse.link) {
+        this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'relay_found', details: { link: relayResponse.link.substring(0, 80) } });
+        return relayResponse.link;
+      }
+
+      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'relay_not_found', details: { stored_count: relayResponse ? relayResponse.stored_count : 0 } });
+
+      // Fallback: try Mailgun stored messages API directly
       const url = `https://api.mailgun.net/v3/${domain}/events?event=stored&recipient=${encodeURIComponent(email)}&limit=5`;
+      const response = await this.httpGet(url, { auth: `api:${apiKey}` });
 
-      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'querying_events', details: { endpoint: 'events', email } });
-
-      const response = await this.httpGet(url, {
-        auth: `api:${apiKey}`,
-      });
-
-      // Check for unauthorized error — this means the user provided a "sending key"
-      // instead of the "Private API key" from Mailgun dashboard
       if (response && response.Error === 'unauthorized') {
         this.emit('workflow_step', {
           workflow_id: 'mailgun', action: 'fetch_verification', status: 'unauthorized',
@@ -1016,61 +1023,32 @@ class WorkflowRunner {
         return null;
       }
 
-      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'events_response', details: { items_count: response && response.items ? response.items.length : 0 } });
-
-      if (response && response.items && response.items.length > 0) {
+      // Collect storage URLs from events
+      const storageUrls = [];
+      if (response && response.items) {
         for (const item of response.items) {
           if (item.storage && item.storage.url) {
-            // Fetch the stored message content from the storage URL
-            const message = await this.httpGet(item.storage.url, {
-              auth: `api:${apiKey}`,
-            });
-
-            if (message && message['body-html']) {
-              const linkMatch = message['body-html'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s<]+/);
-              if (linkMatch) {
-                return linkMatch[0].replace(/&amp;/g, '&');
-              }
-            }
-            if (message && message['body-plain']) {
-              const linkMatch = message['body-plain'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^\s]+/);
-              if (linkMatch) {
-                return linkMatch[0];
-              }
-            }
+            storageUrls.push(item.storage.url);
           }
         }
       }
 
-      // Fallback: try events with "accepted" event type (received emails)
-      const acceptedUrl = `https://api.mailgun.net/v3/${domain}/events?event=accepted&recipient=${encodeURIComponent(email)}&limit=5`;
-      const acceptedResponse = await this.httpGet(acceptedUrl, { auth: `api:${apiKey}` });
+      // Try to fetch stored message content
+      for (const storageUrl of storageUrls) {
+        const message = await this.httpGet(storageUrl, { auth: `api:${apiKey}` });
 
-      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'accepted_response', details: { items_count: acceptedResponse && acceptedResponse.items ? acceptedResponse.items.length : 0 } });
+        if (message && message.message && message.message.includes('retrieval disabled')) {
+          this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'retrieval_disabled', details: { message: 'Mailgun message retrieval disabled — relay service will be used on next poll.' } });
+          return null;
+        }
 
-      // Fallback: Query all recent events for this recipient
-      const allEventsUrl = `https://api.mailgun.net/v3/${domain}/events?recipient=${encodeURIComponent(email)}&limit=10`;
-      const allEvents = await this.httpGet(allEventsUrl, { auth: `api:${apiKey}` });
-
-      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'all_events_response', details: {
-        items_count: allEvents && allEvents.items ? allEvents.items.length : 0,
-        event_types: allEvents && allEvents.items ? allEvents.items.map(i => i.event).filter(Boolean) : [],
-      }});
-
-      // Check if any event has storage URL
-      if (allEvents && allEvents.items) {
-        for (const item of allEvents.items) {
-          if (item.storage && item.storage.url) {
-            const message = await this.httpGet(item.storage.url, { auth: `api:${apiKey}` });
-            if (message && message['body-html']) {
-              const linkMatch = message['body-html'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s<]+/);
-              if (linkMatch) return linkMatch[0].replace(/&amp;/g, '&');
-            }
-            if (message && message['body-plain']) {
-              const linkMatch = message['body-plain'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^\s]+/);
-              if (linkMatch) return linkMatch[0];
-            }
-          }
+        if (message && message['body-html']) {
+          const linkMatch = message['body-html'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s<]+/);
+          if (linkMatch) return linkMatch[0].replace(/&amp;/g, '&');
+        }
+        if (message && message['body-plain']) {
+          const linkMatch = message['body-plain'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^\s]+/);
+          if (linkMatch) return linkMatch[0];
         }
       }
 
