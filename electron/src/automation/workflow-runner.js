@@ -566,27 +566,44 @@ class WorkflowRunner {
       await humanType('input[name="password"]', password);
       await humanDelay(500, 1000);
 
-      // Click Sign Up button
+      // Click Sign Up button — use Puppeteer's page.click() which simulates real mouse events
       const signUpSelector = 'button[type="submit"]';
       await waitAndLog(signUpSelector, 'Sign Up button');
       await humanDelay(500, 1000);
 
-      // Click the button directly using evaluate (more reliable than page.click)
-      const signUpClicked = await page.evaluate(() => {
+      // Log button state for debugging
+      const btnInfo = await page.evaluate(() => {
         const btn = document.querySelector('button[type="submit"]');
-        if (btn) {
-          btn.scrollIntoView();
-          btn.focus();
-          btn.click();
-          return { clicked: true, text: btn.textContent.trim(), disabled: btn.disabled };
-        }
-        return { clicked: false };
+        return btn ? { text: btn.textContent.trim(), disabled: btn.disabled } : null;
       });
-      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted', details: signUpClicked });
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'clicking_signup', details: btnInfo });
+
+      // If button is disabled, force-enable it (React may not have updated state in time)
+      if (btnInfo && btnInfo.disabled) {
+        await page.evaluate(() => {
+          const btn = document.querySelector('button[type="submit"]');
+          if (btn) { btn.disabled = false; btn.removeAttribute('disabled'); }
+        });
+        await humanDelay(200, 400);
+      }
+
+      // Use page.click() — this simulates real mouse down/up/click at the button center
+      // This is the method that worked in the first user test
+      await page.click(signUpSelector);
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted' });
 
       // Wait for page change (confirmation message or redirect)
       await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
       await humanDelay(2000, 3000);
+
+      // If still on register page, try pressing Enter as fallback
+      if (page.url().includes('/register')) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'retrying_enter' });
+        await page.focus('input[name="password"]');
+        await page.keyboard.press('Enter');
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+        await humanDelay(2000, 3000);
+      }
 
       // Check if we got a confirmation message or redirected to dashboard
       const currentUrl = page.url();
@@ -655,15 +672,19 @@ class WorkflowRunner {
         await waitAndLog('button[type="submit"]', 'Sign In button');
         await humanDelay(500, 1000);
 
-        // Click using evaluate for reliability
+        // Force-enable if disabled
         await page.evaluate(() => {
           const btn = document.querySelector('button[type="submit"]');
-          if (btn) { btn.scrollIntoView(); btn.focus(); btn.click(); }
+          if (btn && btn.disabled) { btn.disabled = false; btn.removeAttribute('disabled'); }
         });
+        await humanDelay(200, 400);
 
-        // Wait for navigation (VAPI does client-side redirect)
+        // Use page.click() for real mouse simulation, with navigation wait
         try {
-          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
+            page.click('button[type="submit"]'),
+          ]);
         } catch (navErr) {
           this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'nav_redirect', details: { message: navErr.message } });
         }
