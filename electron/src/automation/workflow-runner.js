@@ -2,10 +2,11 @@
  * FormFlow Desktop Pro — Workflow Runner
  *
  * Executes registration workflows using Puppeteer connected to
- * Electron's embedded Chromium. All stealth flags are already
- * applied at the Electron process level.
+ * real Chrome (auto-detected) or Electron's Chromium as fallback.
+ * Uses nativeInputValueSetter for React form compatibility.
  *
  * Supports:
+ * - Real Chrome detection (preferred for React form compatibility)
  * - Multi-profile browser isolation
  * - Parallel workflow execution
  * - Credential substitution ({{key}} syntax)
@@ -233,11 +234,37 @@ class WorkflowRunner {
     return { success: false, error: lastError, profileId };
   }
 
+  findChromePath() {
+    // Detect real Chrome installation on the system
+    const possiblePaths = process.platform === 'win32' ? [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env.PROGRAMFILES || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ] : process.platform === 'darwin' ? [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    ] : [
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/chromium',
+    ];
+
+    for (const p of possiblePaths) {
+      try {
+        if (p && fs.existsSync(p)) return p;
+      } catch (_) { /* skip */ }
+    }
+    return null;
+  }
+
   async executeWorkflow(config, profilePath, fingerprint, workflowId, profileId) {
-    // Connect to Electron's own Chromium via the remote debugging protocol
-    // Electron exposes this when launched with --remote-debugging-port
-    // For workflow isolation, we launch a separate Chromium instance via puppeteer
-    const execPath = process.execPath;
+    // Use real Chrome if available — this handles React forms much better
+    // than Electron's Chromium because events are dispatched identically to real user input
+    const chromePath = this.findChromePath();
+    const execPath = chromePath || process.execPath;
+    const usingRealChrome = !!chromePath;
 
     this.emit('browser_launch', {
       workflow_id: workflowId,
@@ -247,6 +274,8 @@ class WorkflowRunner {
         fingerprint,
         stealth: true,
         user_data_dir: profilePath,
+        browser: usingRealChrome ? 'Chrome' : 'Electron Chromium',
+        chrome_path: usingRealChrome ? chromePath : 'not found',
       },
     });
 
@@ -282,6 +311,7 @@ class WorkflowRunner {
         '--use-mock-keychain',
         '--disable-features=IsolateOrigins,site-per-process,TranslateUI',
         '--enable-features=NetworkService,NetworkServiceInProcess',
+        '--disable-extensions',
         `--user-agent=${fingerprint.userAgent}`,
         `--window-size=${fingerprint.viewport.width},${fingerprint.viewport.height}`,
         `--lang=${fingerprint.locale}`,
@@ -532,13 +562,26 @@ class WorkflowRunner {
       return new Promise(r => setTimeout(r, ms));
     };
 
-    // Helper: type with human-like delays
+    // Helper: type with human-like delays, then ensure React state is updated
     const humanType = async (selector, text) => {
       await page.click(selector, { clickCount: 3 }); // select existing text
       await humanDelay(100, 300);
       for (const char of text) {
         await page.type(selector, char, { delay: Math.floor(Math.random() * 80 + 30) });
       }
+      // Ensure React picks up the value — use nativeInputValueSetter
+      // This is critical for React controlled components that may not update
+      // from Puppeteer's keyboard events alone
+      await page.evaluate((sel, val) => {
+        const input = document.querySelector(sel);
+        if (!input) return;
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, 'value'
+        ).set;
+        nativeSetter.call(input, val);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }, selector, text);
     };
 
     try {
