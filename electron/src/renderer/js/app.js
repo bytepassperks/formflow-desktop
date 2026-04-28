@@ -118,6 +118,18 @@ document.getElementById('loadVapiPresetBtn').addEventListener('click', () => {
 });
 
 // ═══════════════════════════════════════════════════
+// Bulk Registration Mode Toggle
+// ═══════════════════════════════════════════════════
+document.getElementById('bulkModeToggle').addEventListener('change', (e) => {
+  const enabled = e.target.checked;
+  document.getElementById('bulkCount').disabled = !enabled;
+  document.getElementById('bulkInfo').style.display = enabled ? 'block' : 'none';
+  if (enabled) {
+    addEvent('app_lifecycle', 'bulk_mode_enabled', 'Bulk registration mode enabled. Random emails will be generated for each account.');
+  }
+});
+
+// ═══════════════════════════════════════════════════
 // Workflow Steps Management
 // ═══════════════════════════════════════════════════
 const ACTIONS = ['navigate', 'fill', 'click', 'select', 'wait', 'submit', 'check'];
@@ -194,6 +206,9 @@ async function startWorkflow() {
   document.getElementById('stopBtn').disabled = false;
   updateProgress('Running...', 0);
 
+  const bulkMode = document.getElementById('bulkModeToggle').checked;
+  const bulkCount = parseInt(document.getElementById('bulkCount').value) || 5;
+
   const params = {
     workflow_config: {
       name: document.getElementById('workflowName').value || 'Workflow',
@@ -203,6 +218,8 @@ async function startWorkflow() {
       navigation_timeout_ms: parseInt(document.getElementById('navTimeout').value),
       selector_timeout_ms: parseInt(document.getElementById('selectorTimeout').value),
       action_delay_ms: parseInt(document.getElementById('actionDelay').value),
+      bulk_mode: bulkMode,
+      bulk_count: bulkMode ? bulkCount : 0,
     },
     max_parallel_runs: parseInt(document.getElementById('parallelRuns').value),
     max_retries: parseInt(document.getElementById('maxRetries').value),

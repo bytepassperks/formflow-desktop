@@ -103,6 +103,11 @@ class WorkflowRunner {
       vpn_settings = {},
     } = params;
 
+    // Bulk registration mode: generate unique emails and run sequentially
+    if (config.bulk_mode && config.bulk_count > 0) {
+      return this.executeBulkRegistration(params);
+    }
+
     const results = [];
     const concurrency = Math.min(max_parallel_runs, 5);
 
@@ -1008,6 +1013,262 @@ class WorkflowRunner {
 
       req.on('error', reject);
       req.setTimeout(10000, () => { req.destroy(); reject(new Error('Request timeout')); });
+      req.end();
+    });
+  }
+
+  // ═══════════════════════════════════════════════════
+  // Bulk Registration — Generate N accounts sequentially
+  // ═══════════════════════════════════════════════════
+
+  generateRandomEmail(domain) {
+    const adjectives = ['swift', 'brave', 'calm', 'keen', 'bold', 'quick', 'wise', 'cool', 'fair', 'pure', 'true', 'warm', 'wild', 'free', 'deep'];
+    const nouns = ['falcon', 'phoenix', 'river', 'storm', 'cloud', 'tiger', 'eagle', 'fox', 'wolf', 'bear', 'hawk', 'lion', 'star', 'moon', 'oak'];
+    const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
+    const noun = nouns[Math.floor(Math.random() * nouns.length)];
+    const num = Math.floor(Math.random() * 9000 + 1000);
+    return `${adj}.${noun}${num}@${domain}`;
+  }
+
+  async ensureMailgunCatchAllRoute(apiKey, domain) {
+    // Create a catch-all route in Mailgun to store all incoming emails
+    // This enables verification email retrieval for any generated address
+    try {
+      // First check if a catch-all route already exists
+      const existingRoutes = await this.httpGet(`https://api.mailgun.net/v3/routes`, { auth: `api:${apiKey}` });
+
+      if (existingRoutes && existingRoutes.items) {
+        const hasCatchAll = existingRoutes.items.some(r =>
+          r.expression && r.expression.includes('catch_all()')
+        );
+        if (hasCatchAll) {
+          this.emit('workflow_step', { action: 'mailgun_route', status: 'exists', details: { message: 'Catch-all route already exists' } });
+          return true;
+        }
+      }
+
+      // Create catch-all route with store() action
+      const routeCreated = await this.httpPost(`https://api.mailgun.net/v3/routes`, {
+        auth: `api:${apiKey}`,
+        form: {
+          priority: 10,
+          description: 'FormFlow catch-all for email verification',
+          expression: 'catch_all()',
+          action: ['store(notify="http://localhost")', 'stop()'],
+        },
+      });
+
+      if (routeCreated && routeCreated.route) {
+        this.emit('workflow_step', { action: 'mailgun_route', status: 'created', details: { route_id: routeCreated.route.id } });
+        return true;
+      }
+
+      return false;
+    } catch (err) {
+      this.emit('workflow_step', { action: 'mailgun_route', status: 'error', details: { error: err.message } });
+      return false;
+    }
+  }
+
+  async executeBulkRegistration(params) {
+    const { workflow_config: config, max_retries = 2 } = params;
+    const creds = config.credentials || {};
+    const bulkCount = config.bulk_count || 1;
+    const defaultPassword = creds.password;
+    if (!defaultPassword) {
+      throw new Error('Bulk registration requires a password in credentials');
+    }
+    const mailgunApiKey = creds.mailgun_api_key || creds.mailgunApiKey || '';
+    const mailgunDomain = creds.mailgun_domain || creds.mailgunDomain || '';
+    const promoCode = creds.promo_code || creds.promoCode || '';
+
+    if (!mailgunDomain) {
+      throw new Error('Bulk registration requires mailgun_domain to generate email addresses');
+    }
+
+    this.emit('workflow_started', {
+      status: 'started',
+      details: {
+        mode: 'bulk_registration',
+        count: bulkCount,
+        domain: mailgunDomain,
+      },
+    });
+
+    // Ensure catch-all route exists for email verification
+    if (mailgunApiKey) {
+      await this.ensureMailgunCatchAllRoute(mailgunApiKey, mailgunDomain);
+    }
+
+    // Generate unique emails
+    const accounts = [];
+    const usedEmails = new Set();
+    for (let i = 0; i < bulkCount; i++) {
+      let email;
+      do {
+        email = this.generateRandomEmail(mailgunDomain);
+      } while (usedEmails.has(email));
+      usedEmails.add(email);
+      accounts.push({ email, password: defaultPassword, index: i + 1 });
+    }
+
+    this.emit('workflow_step', {
+      action: 'bulk_emails_generated',
+      status: 'success',
+      details: { count: accounts.length, sample: accounts.slice(0, 3).map(a => a.email) },
+    });
+
+    // Execute registrations sequentially
+    const results = [];
+    let completed = 0;
+    let failed = 0;
+
+    for (const account of accounts) {
+      if (this.stopped) break;
+
+      this.emit('workflow_step', {
+        action: 'bulk_account_start',
+        status: 'starting',
+        details: { index: account.index, total: bulkCount, email: account.email },
+      });
+
+      // Create a config copy with this account's credentials
+      const accountConfig = {
+        ...config,
+        credentials: {
+          ...creds,
+          email: account.email,
+          password: account.password,
+        },
+        bulk_mode: false, // Prevent recursion
+      };
+
+      // Run single workflow for this account
+      const job = {
+        profileId: `profile_bulk_${String(account.index).padStart(3, '0')}`,
+        profileIndex: account.index - 1,
+        config: accountConfig,
+        maxRetries: max_retries,
+      };
+
+      try {
+        const result = await this.runSingleWorkflow(job);
+        results.push({ ...result, email: account.email });
+
+        if (result.success) {
+          completed++;
+          this.emit('workflow_step', {
+            action: 'bulk_account_done',
+            status: 'success',
+            details: { index: account.index, email: account.email },
+          });
+        } else {
+          failed++;
+          this.emit('workflow_step', {
+            action: 'bulk_account_done',
+            status: 'failed',
+            details: { index: account.index, email: account.email, error: result.error },
+          });
+        }
+      } catch (err) {
+        failed++;
+        results.push({ success: false, email: account.email, error: err.message });
+        this.emit('workflow_step', {
+          action: 'bulk_account_done',
+          status: 'error',
+          details: { index: account.index, email: account.email, error: err.message },
+        });
+      }
+
+      this.onProgress({
+        total_jobs: bulkCount,
+        completed,
+        failed,
+        queued: bulkCount - completed - failed,
+      });
+
+      // Brief pause between accounts to avoid rate limiting
+      if (account.index < bulkCount && !this.stopped) {
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+
+    // Save generated accounts to a file
+    const accountsLog = {
+      generated_at: new Date().toISOString(),
+      total: bulkCount,
+      completed,
+      failed,
+      accounts: results.map(r => ({
+        email: r.email,
+        password: defaultPassword,
+        success: r.success,
+        error: r.error || null,
+      })),
+    };
+
+    const accountsPath = path.join(this.logsDir, `bulk_accounts_${Date.now()}.json`);
+    fs.writeFileSync(accountsPath, JSON.stringify(accountsLog, null, 2));
+
+    this.emit('workflow_finished', {
+      status: 'finished',
+      details: {
+        mode: 'bulk_registration',
+        total: bulkCount,
+        completed,
+        failed,
+        accounts_file: accountsPath,
+      },
+    });
+
+    this.saveEventsLog();
+    return results;
+  }
+
+  httpPost(url, options = {}) {
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const mod = parsedUrl.protocol === 'https:' ? https : http;
+
+      // Build form data
+      let body = '';
+      if (options.form) {
+        const parts = [];
+        for (const [key, val] of Object.entries(options.form)) {
+          if (Array.isArray(val)) {
+            val.forEach(v => parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(v)}`));
+          } else {
+            parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(val)}`);
+          }
+        }
+        body = parts.join('&');
+      }
+
+      const reqOptions = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      };
+
+      if (options.auth) {
+        reqOptions.headers['Authorization'] = 'Basic ' + Buffer.from(options.auth).toString('base64');
+      }
+
+      const req = mod.request(reqOptions, (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); } catch { resolve(data); }
+        });
+      });
+
+      req.on('error', reject);
+      req.setTimeout(10000, () => { req.destroy(); reject(new Error('Request timeout')); });
+      req.write(body);
       req.end();
     });
   }

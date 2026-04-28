@@ -96,6 +96,26 @@
           </div>
         </section>
 
+        <!-- Bulk Registration Mode -->
+        <section class="card">
+          <h2 class="card-title">Bulk Registration Mode</h2>
+          <p class="card-desc">Auto-generate unique email addresses and register multiple accounts sequentially. Requires Mailgun API key and domain.</p>
+          <div class="settings-grid">
+            <div class="form-row">
+              <label>
+                <input type="checkbox" id="bulkModeToggle"> Enable Bulk Registration
+              </label>
+            </div>
+            <div class="form-row">
+              <label>Number of Accounts</label>
+              <input type="number" id="bulkCount" min="1" max="100" value="5" disabled>
+            </div>
+          </div>
+          <p class="card-desc" id="bulkInfo" style="display:none; color: #f0ad4e;">
+            Bulk mode generates random emails like <code>swift.falcon1234@yourdomain.com</code> with default password. Requires <strong>mailgun_api_key</strong> and <strong>mailgun_domain</strong> in credentials for email verification.
+          </p>
+        </section>
+
         <!-- Execution Settings -->
         <section class="card">
           <h2 class="card-title">Execution Settings</h2>
