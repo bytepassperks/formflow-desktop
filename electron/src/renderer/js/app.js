@@ -301,41 +301,59 @@ document.getElementById('scanVpnBtn').addEventListener('click', async () => {
 
   if (clients && clients.length > 0) {
     listEl.innerHTML = '';
+    const cliClients = clients.filter(c => c.hasCli !== false && !c.guiOnly);
     clients.forEach(c => {
       const card = document.createElement('div');
       card.className = 'vpn-client-card';
+      const isGuiOnly = c.guiOnly || c.hasCli === false;
+      const statusBadge = isGuiOnly
+        ? '<span class="badge badge-yellow">GUI Only</span>'
+        : '<span class="badge badge-green">CLI Ready</span>';
       card.innerHTML = `
         <div>
-          <div class="vpn-client-name">${escapeHtml(c.name)}</div>
+          <div class="vpn-client-name">${escapeHtml(c.name)}${isGuiOnly ? ' <small>(no CLI — cannot automate)</small>' : ''}</div>
           <div class="vpn-client-path">${escapeHtml(c.path)}</div>
         </div>
-        <span class="badge badge-green">Detected</span>
+        ${statusBadge}
       `;
       listEl.appendChild(card);
 
-      const option = document.createElement('option');
-      option.value = c.name;
-      option.textContent = c.name;
-      selectEl.appendChild(option);
+      // Only add CLI-capable VPNs to the connect dropdown
+      if (!isGuiOnly) {
+        const option = document.createElement('option');
+        option.value = c.name;
+        option.textContent = c.name;
+        selectEl.appendChild(option);
+      }
     });
 
-    // Populate locations for first client
-    populateLocations(clients[0]);
+    // If no CLI-capable clients found, show message
+    if (cliClients.length === 0) {
+      selectEl.innerHTML = '<option value="">No CLI-capable VPN found (Surfshark is GUI-only)</option>';
+      addEvent('vpn', 'vpn_scan_complete', 'Found VPN clients but none have CLI support. Install ExpressVPN, NordVPN, or Windscribe for automated connections.');
+    } else {
+      // Populate locations for first CLI-capable client
+      populateLocations(cliClients[0]);
 
-    // Populate location queue display
-    const queueEl = document.getElementById('locationQueue');
-    queueEl.innerHTML = '';
-    const firstLabels = clients[0].locationLabels || {};
-    clients[0].locations.forEach((loc, i) => {
-      const item = document.createElement('span');
-      item.className = `location-item${i === 0 ? ' active' : ''}`;
-      item.textContent = firstLabels[loc] || loc;
-      queueEl.appendChild(item);
-    });
+      // Populate location queue display
+      const queueEl = document.getElementById('locationQueue');
+      queueEl.innerHTML = '';
+      const firstLabels = cliClients[0].locationLabels || {};
+      cliClients[0].locations.forEach((loc, i) => {
+        const item = document.createElement('span');
+        item.className = `location-item${i === 0 ? ' active' : ''}`;
+        item.textContent = firstLabels[loc] || loc;
+        queueEl.appendChild(item);
+      });
+    }
 
-    addEvent('vpn', 'vpn_detected', `Found ${clients.length} VPN client(s): ${clients.map(c => c.name).join(', ')}`);
-    document.getElementById('vpnBadge').textContent = `VPN: ${clients[0].name}`;
-    document.getElementById('vpnBadge').className = 'badge badge-blue';
+    const guiOnlyNames = clients.filter(c => c.guiOnly).map(c => c.name);
+    const cliNames = cliClients.map(c => c.name);
+    let scanMsg = `Found ${clients.length} VPN client(s): ${clients.map(c => c.name).join(', ')}`;
+    if (guiOnlyNames.length > 0) scanMsg += ` (${guiOnlyNames.join(', ')}: GUI-only, no CLI)`;
+    addEvent('vpn', 'vpn_detected', scanMsg);
+    document.getElementById('vpnBadge').textContent = cliClients.length > 0 ? `VPN: ${cliClients[0].name}` : 'VPN: No CLI';
+    document.getElementById('vpnBadge').className = cliClients.length > 0 ? 'badge badge-blue' : 'badge badge-yellow';
   } else {
     listEl.innerHTML = '<p class="muted">No VPN clients detected.</p>';
     selectEl.innerHTML = '<option value="">No VPN detected</option>';
@@ -359,16 +377,25 @@ document.getElementById('vpnConnectBtn').addEventListener('click', async () => {
   try {
     const result = await window.formflow.connectVPN(client, location);
     if (result && result.success) {
-      document.getElementById('vpnStatus').textContent = `Status: Connected (${locLabel}) — IP: ${result.ip || 'N/A'}`;
+      const ipInfo = result.previousIp ? `${result.previousIp} → ${result.ip}` : result.ip;
+      document.getElementById('vpnStatus').textContent = `Status: Connected (${locLabel}) — IP: ${ipInfo}`;
       document.getElementById('vpnBadge').textContent = `VPN: ${locLabel}`;
       document.getElementById('vpnBadge').className = 'badge badge-green';
       document.getElementById('ipBadge').textContent = `IP: ${result.ip || 'N/A'}`;
       document.getElementById('ipBadge').className = 'badge badge-blue';
-      addEvent('vpn', 'vpn_connected', `Connected to ${client} → ${locLabel} (IP: ${result.ip || 'N/A'})`);
+      addEvent('vpn', 'vpn_connected', `Connected to ${client} → ${locLabel} (IP changed: ${ipInfo})`);
     } else {
-      document.getElementById('vpnStatus').textContent = `Status: Connection failed`;
+      const errMsg = result?.error || 'Failed to connect';
+      const isGuiOnly = result?.guiOnly;
+      document.getElementById('vpnStatus').textContent = isGuiOnly
+        ? `Status: ${client} is GUI-only — use ExpressVPN, NordVPN, or Windscribe`
+        : `Status: Connection failed — ${errMsg}`;
       document.getElementById('vpnBadge').className = 'badge badge-red';
-      addEvent('vpn', 'vpn_connection_failed', result?.error || 'Failed to connect');
+      addEvent('vpn', 'vpn_connection_failed', errMsg);
+      // Show debug log entries if available
+      if (result?.debug && result.debug.length > 0) {
+        result.debug.forEach(d => addEvent('vpn', 'vpn_debug', `[${d.time}] ${d.message}`));
+      }
     }
   } catch (err) {
     document.getElementById('vpnStatus').textContent = `Status: Error — ${err.message}`;

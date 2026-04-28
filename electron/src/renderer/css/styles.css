@@ -106,6 +106,12 @@ body {
   border: 1px solid rgba(0, 212, 255, 0.3);
 }
 
+.badge-yellow {
+  background: rgba(255, 165, 2, 0.15);
+  color: var(--accent-orange);
+  border: 1px solid rgba(255, 165, 2, 0.3);
+}
+
 /* ═══ TABS ═══ */
 .tab-nav {
   display: flex;

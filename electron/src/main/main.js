@@ -207,9 +207,10 @@ ipcMain.handle('vpn:scan', async () => {
   const detector = new VPNDetector();
   vpnState.detectedClients = detector.scanAll();
 
-  // Auto-initialize controller with first detected client
-  if (vpnState.detectedClients.length > 0 && !vpnState.controller) {
-    const firstClient = vpnState.detectedClients[0];
+  // Auto-initialize controller with first CLI-capable client
+  const cliClients = vpnState.detectedClients.filter(c => c.hasCli !== false && !c.guiOnly);
+  if (cliClients.length > 0 && !vpnState.controller) {
+    const firstClient = cliClients[0];
     vpnState.controller = createVPNController(firstClient);
     vpnState.activeClient = firstClient.name;
   }

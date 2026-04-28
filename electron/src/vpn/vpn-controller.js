@@ -4,16 +4,24 @@
  * Controls VPN connections using the actual detected executable paths.
  * Uses correct Windows CLI commands for each VPN client.
  *
- * NordVPN: Has proper CLI — `"path\nordvpn.exe" -c -g "location"`
- * Surfshark: GUI-based — uses `cmd /c start` to launch with connection
- * ExpressVPN: CLI daemon — `"path\expressvpn.exe" connect "location"`
+ * Supported VPNs with working CLI:
+ *   NordVPN:    `nordvpn.exe -c -g "United States"` (full country names)
+ *   ExpressVPN: `ExpressVPN.CLI.exe connect "USA"` (in services/ subdirectory)
+ *   Windscribe: `windscribe-cli.exe connect "United States"` (free tier available)
+ *
+ * NOT supported via CLI:
+ *   Surfshark:  GUI-only app, no CLI interface. Detected but cannot connect programmatically.
  */
 
-const { exec, execSync } = require('child_process');
+const { exec } = require('child_process');
 const https = require('https');
+const http = require('http');
 const path = require('path');
 
 const MAX_CONNECT_RETRIES = 2;
+const IP_POLL_INTERVAL_MS = 2000;
+const IP_POLL_MAX_WAIT_MS = 20000;
+const POST_COMMAND_WAIT_MS = 5000;
 
 class VPNController {
   constructor(clientName, clientPath = null, installDir = null) {
@@ -24,6 +32,7 @@ class VPNController {
     this.currentLocation = null;
     this.locationQueue = [];
     this.locationIndex = 0;
+    this.debugLog = [];
   }
 
   setLocations(locations) {
@@ -31,9 +40,23 @@ class VPNController {
     this.locationIndex = 0;
   }
 
+  log(message) {
+    const entry = { time: new Date().toISOString(), message };
+    this.debugLog.push(entry);
+    if (this.debugLog.length > 100) this.debugLog.shift();
+  }
+
   async connect(location = null) {
     if (!this.clientName) {
       return { success: false, error: 'No VPN client specified' };
+    }
+
+    if (this.clientName === 'Surfshark') {
+      return {
+        success: false,
+        error: 'Surfshark has no CLI on Windows — it is a GUI-only app. Please use ExpressVPN, NordVPN, or Windscribe instead.',
+        guiOnly: true,
+      };
     }
 
     const targetLocation = location || this.getNextLocation();
@@ -43,32 +66,55 @@ class VPNController {
 
     const cmd = this.buildConnectCommand(targetLocation);
     if (!cmd) {
-      return { success: false, error: `Cannot build connect command for ${this.clientName}. Executable path: ${this.clientPath || 'unknown'}` };
+      return {
+        success: false,
+        error: `Cannot build connect command for ${this.clientName}. Path: ${this.clientPath || 'not found'}`,
+      };
     }
+
+    this.log(`Capturing IP before connection...`);
+    const ipBefore = await this.checkPublicIp();
+    this.log(`IP before: ${ipBefore || 'unknown'}`);
 
     let lastError = null;
     for (let attempt = 0; attempt <= MAX_CONNECT_RETRIES; attempt++) {
       try {
-        await this.runCommand(cmd, 30000);
+        this.log(`Attempt ${attempt + 1}/${MAX_CONNECT_RETRIES + 1}: Running command: ${cmd}`);
+        const cmdOutput = await this.runCommand(cmd, 45000);
+        this.log(`Command output: ${cmdOutput || '(empty)'}`);
 
-        // Wait a moment for VPN to establish
-        await new Promise(r => setTimeout(r, 3000));
+        this.log(`Waiting ${POST_COMMAND_WAIT_MS}ms for VPN to establish...`);
+        await new Promise(r => setTimeout(r, POST_COMMAND_WAIT_MS));
 
-        // Verify IP changed (wait up to 15 seconds)
-        const ip = await this.checkPublicIp();
+        this.log(`Polling for IP change (max ${IP_POLL_MAX_WAIT_MS}ms)...`);
+        const newIp = await this.pollForIpChange(ipBefore, IP_POLL_MAX_WAIT_MS);
+
+        if (newIp && ipBefore && newIp === ipBefore) {
+          const errMsg = `VPN command ran but IP did not change (still ${ipBefore}). The VPN may not have connected. Command: ${cmd}`;
+          this.log(errMsg);
+          lastError = errMsg;
+          if (attempt < MAX_CONNECT_RETRIES) {
+            await new Promise(r => setTimeout(r, 3000));
+          }
+          continue;
+        }
 
         this.connected = true;
         this.currentLocation = targetLocation;
+        this.log(`Connected! IP changed: ${ipBefore} → ${newIp}`);
 
         return {
           success: true,
           location: targetLocation,
-          ip: ip || 'unknown',
+          ip: newIp || 'unknown',
+          previousIp: ipBefore || 'unknown',
+          debug: this.debugLog.slice(-10),
         };
       } catch (err) {
         lastError = err.message;
+        this.log(`Attempt ${attempt + 1} failed: ${lastError}`);
         if (attempt < MAX_CONNECT_RETRIES) {
-          await new Promise(r => setTimeout(r, 2000));
+          await new Promise(r => setTimeout(r, 3000));
         }
       }
     }
@@ -77,7 +123,31 @@ class VPNController {
       success: false,
       error: `Failed after ${MAX_CONNECT_RETRIES + 1} attempts: ${lastError}`,
       location: targetLocation,
+      currentIp: ipBefore || 'unknown',
+      debug: this.debugLog.slice(-15),
     };
+  }
+
+  async pollForIpChange(originalIp, maxWaitMs) {
+    const startTime = Date.now();
+    let lastIp = null;
+
+    while (Date.now() - startTime < maxWaitMs) {
+      lastIp = await this.checkPublicIp();
+      this.log(`IP poll: ${lastIp}`);
+
+      if (lastIp && originalIp && lastIp !== originalIp) {
+        return lastIp;
+      }
+
+      if (!originalIp && lastIp) {
+        return lastIp;
+      }
+
+      await new Promise(r => setTimeout(r, IP_POLL_INTERVAL_MS));
+    }
+
+    return lastIp;
   }
 
   async disconnect() {
@@ -89,12 +159,12 @@ class VPNController {
     }
 
     try {
+      this.log(`Disconnecting: ${cmd}`);
       await this.runCommand(cmd, 15000);
       this.connected = false;
       this.currentLocation = null;
       return { success: true };
     } catch (err) {
-      // Even if disconnect command fails, mark as disconnected
       this.connected = false;
       this.currentLocation = null;
       return { success: false, error: err.message };
@@ -133,59 +203,117 @@ class VPNController {
     }
   }
 
-  /**
-   * Build the correct connect command for the detected VPN client.
-   * Uses the full executable path found by the detector.
-   */
   buildConnectCommand(location) {
     const exePath = this.clientPath;
 
     switch (this.clientName) {
-      case 'NordVPN':
-        // NordVPN CLI: nordvpn.exe -c -g "United States"
+      case 'NordVPN': {
+        // NordVPN Windows CLI: nordvpn.exe -c -g "United States"
+        // Docs: https://support.nordvpn.com/hc/en-us/articles/19919384880145
         if (exePath) {
           return `"${exePath}" -c -g "${location}"`;
         }
         return `nordvpn -c -g "${location}"`;
+      }
 
-      case 'Surfshark':
-        // Surfshark on Windows: Try multiple approaches
-        // 1. Direct CLI if available
-        // 2. Launch via start command
-        if (exePath) {
-          // Try using the Surfshark exe with connect argument
-          // Surfshark 2.x+ supports: Surfshark.exe --connect --location <code>
-          return `"${exePath}" --connect --location "${location}"`;
+      case 'ExpressVPN': {
+        // ExpressVPN Windows CLI: ExpressVPN.CLI.exe connect "location"
+        // CLI is at: C:\Program Files (x86)\ExpressVPN\services\ExpressVPN.CLI.exe
+        // Docs: https://expressvpn.com/support/vpn-setup/how-to-use-expressvpn-cli-windows/
+        // Requires admin elevation.
+        const cliExe = this.findExpressVpnCli();
+        if (cliExe) {
+          return `"${cliExe}" connect "${location}"`;
         }
         return null;
+      }
 
-      case 'ExpressVPN':
-        // ExpressVPN CLI: expressvpn.exe connect "location"
+      case 'Windscribe': {
+        // Windscribe Windows CLI: windscribe-cli.exe connect "location"
+        // Docs: https://github.com/Windscribe/Desktop-App
+        // Location: city name, country name, or ISO code (case-insensitive)
         if (exePath) {
           return `"${exePath}" connect "${location}"`;
         }
-        return `expressvpn connect "${location}"`;
+        return `windscribe-cli connect "${location}"`;
+      }
+
+      case 'Surfshark':
+        return null;
 
       default:
         return null;
     }
   }
 
-  buildDisconnectCommand() {
-    const exePath = this.clientPath;
+  findExpressVpnCli() {
+    const fs = require('fs');
 
+    // ExpressVPN CLI is in the services/ subdirectory, named ExpressVPN.CLI.exe
+    const candidates = [];
+
+    if (this.installDir) {
+      candidates.push(
+        path.join(this.installDir, 'services', 'ExpressVPN.CLI.exe'),
+        path.join(this.installDir, 'ExpressVPN.CLI.exe'),
+      );
+    }
+
+    if (this.clientPath) {
+      const dir = path.dirname(this.clientPath);
+      candidates.push(
+        path.join(dir, 'services', 'ExpressVPN.CLI.exe'),
+        path.join(dir, 'ExpressVPN.CLI.exe'),
+      );
+      // If clientPath is already in services/
+      if (dir.toLowerCase().endsWith('services')) {
+        candidates.push(path.join(dir, 'ExpressVPN.CLI.exe'));
+      }
+    }
+
+    // Hardcoded known paths
+    candidates.push(
+      'C:\\Program Files (x86)\\ExpressVPN\\services\\ExpressVPN.CLI.exe',
+      'C:\\Program Files\\ExpressVPN\\services\\ExpressVPN.CLI.exe',
+    );
+
+    for (const candidate of candidates) {
+      try {
+        if (fs.existsSync(candidate)) {
+          this.log(`Found ExpressVPN CLI: ${candidate}`);
+          return candidate;
+        }
+      } catch {
+        // skip
+      }
+    }
+
+    this.log('ExpressVPN.CLI.exe not found in any expected location');
+    return null;
+  }
+
+  buildDisconnectCommand() {
     switch (this.clientName) {
-      case 'NordVPN':
+      case 'NordVPN': {
+        const exePath = this.clientPath;
         if (exePath) return `"${exePath}" -d`;
         return 'nordvpn -d';
+      }
+
+      case 'ExpressVPN': {
+        const cliExe = this.findExpressVpnCli();
+        if (cliExe) return `"${cliExe}" disconnect`;
+        return null;
+      }
+
+      case 'Windscribe': {
+        const exePath = this.clientPath;
+        if (exePath) return `"${exePath}" disconnect`;
+        return 'windscribe-cli disconnect';
+      }
 
       case 'Surfshark':
-        if (exePath) return `"${exePath}" --disconnect`;
         return null;
-
-      case 'ExpressVPN':
-        if (exePath) return `"${exePath}" disconnect`;
-        return 'expressvpn disconnect';
 
       default:
         return null;
@@ -193,14 +321,32 @@ class VPNController {
   }
 
   async checkPublicIp() {
+    const services = [
+      { url: 'https://api.ipify.org?format=json', parse: (d) => JSON.parse(d).ip },
+      { url: 'https://ipinfo.io/json', parse: (d) => JSON.parse(d).ip },
+      { url: 'http://ip-api.com/json', parse: (d) => JSON.parse(d).query, useHttp: true },
+    ];
+
+    for (const svc of services) {
+      try {
+        const ip = await this.fetchIp(svc.url, svc.parse, svc.useHttp);
+        if (ip) return ip;
+      } catch {
+        // try next
+      }
+    }
+    return null;
+  }
+
+  fetchIp(url, parseFn, useHttp = false) {
+    const mod = useHttp ? http : https;
     return new Promise((resolve) => {
-      const req = https.get('https://api.ipify.org?format=json', { timeout: 10000 }, (res) => {
+      const req = mod.get(url, { timeout: 8000 }, (res) => {
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
           try {
-            const { ip } = JSON.parse(data);
-            resolve(ip);
+            resolve(parseFn(data));
           } catch {
             resolve(null);
           }
@@ -215,9 +361,9 @@ class VPNController {
     return new Promise((resolve, reject) => {
       exec(cmd, { timeout: timeoutMs, windowsHide: true }, (error, stdout, stderr) => {
         if (error) {
-          reject(new Error(`Command failed: ${cmd}\n${error.message}\n${stderr || ''}`));
+          reject(new Error(`Command failed: ${cmd}\nError: ${error.message}\nStderr: ${stderr || ''}\nStdout: ${stdout || ''}`));
         } else {
-          resolve(stdout.trim());
+          resolve((stdout || '').trim());
         }
       });
     });
@@ -231,6 +377,7 @@ class VPNController {
       location: this.currentLocation,
       queueSize: this.locationQueue.length,
       queueIndex: this.locationIndex,
+      recentLog: this.debugLog.slice(-5),
     };
   }
 }
