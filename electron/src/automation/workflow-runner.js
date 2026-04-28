@@ -28,6 +28,7 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const https = require('https');
 const http = require('http');
+const { spawn } = require('child_process');
 
 // Supabase anon key — embedded in VAPI's frontend JS, not a secret
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp0dXlwcmpqZ3hiZ210aml5a29hIiwicm9sZSI6ImFub24iLCJpYXQiOjE2OTQ2NDQ5OTAsImV4cCI6MjAxMDIyMDk5MH0.TByTGnMGMHB3jT9jLCX51PUune9BuOS-PsdI4FYAJRs';
@@ -268,11 +269,61 @@ class WorkflowRunner {
     return null;
   }
 
+  async launchChromeManually(chromePath, profilePath, fingerprint) {
+    // Launch Chrome as a normal process (NOT through Puppeteer) so that
+    // Turnstile sees it as a regular browser, not an automated one.
+    // Then connect via puppeteer.connect() to the debugging port.
+    const port = 9222 + Math.floor(Math.random() * 1000);
+
+    const args = [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${profilePath}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      `--window-size=${fingerprint.viewport.width},${fingerprint.viewport.height}`,
+      `--lang=${fingerprint.locale}`,
+      '--disable-background-networking',
+      '--disable-sync',
+      '--disable-default-apps',
+      '--disable-popup-blocking',
+      '--disable-prompt-on-repost',
+      '--password-store=basic',
+      'about:blank',
+    ];
+
+    const chromeProc = spawn(chromePath, args, {
+      detached: false,
+      stdio: 'ignore',
+    });
+
+    // Wait for Chrome's debugging port to become available
+    let wsUrl = null;
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      try {
+        const jsonUrl = `http://127.0.0.1:${port}/json/version`;
+        const data = await new Promise((resolve, reject) => {
+          http.get(jsonUrl, (res) => {
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => { try { resolve(JSON.parse(body)); } catch { reject(new Error('bad json')); } });
+          }).on('error', reject);
+        });
+        wsUrl = data.webSocketDebuggerUrl;
+        if (wsUrl) break;
+      } catch { /* not ready yet */ }
+    }
+
+    if (!wsUrl) {
+      try { chromeProc.kill(); } catch {}
+      throw new Error('Chrome debugging port did not become available');
+    }
+
+    return { chromeProc, wsUrl, port };
+  }
+
   async executeWorkflow(config, profilePath, fingerprint, workflowId, profileId) {
-    // Use real Chrome if available — this handles React forms much better
-    // than Electron's Chromium because events are dispatched identically to real user input
     const chromePath = this.findChromePath();
-    const execPath = chromePath || process.execPath;
     const usingRealChrome = !!chromePath;
 
     this.emit('browser_launch', {
@@ -283,64 +334,44 @@ class WorkflowRunner {
         fingerprint,
         stealth: true,
         user_data_dir: profilePath,
-        browser: usingRealChrome ? 'Chrome' : 'Electron Chromium',
+        browser: usingRealChrome ? 'Chrome (manual launch + CDP connect)' : 'Electron Chromium',
         chrome_path: usingRealChrome ? chromePath : 'not found',
       },
     });
 
-    const browser = await puppeteer.launch({
-      executablePath: execPath,
-      userDataDir: profilePath,
-      headless: false,
-      ignoreDefaultArgs: ['--enable-automation'],
-      ignoreHTTPSErrors: true,
-      args: [
-        '--no-sandbox',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-infobars',
-        '--disable-web-security',
-        '--disable-background-networking',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-breakpad',
-        '--disable-client-side-phishing-detection',
-        '--disable-component-update',
-        '--disable-default-apps',
-        '--disable-dev-shm-usage',
-        '--disable-hang-monitor',
-        '--disable-ipc-flooding-protection',
-        '--disable-popup-blocking',
-        '--disable-prompt-on-repost',
-        '--disable-renderer-backgrounding',
-        '--disable-sync',
-        '--ignore-certificate-errors',
-        '--allow-running-insecure-content',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--password-store=basic',
-        '--use-mock-keychain',
-        '--disable-features=IsolateOrigins,site-per-process,TranslateUI',
-        '--enable-features=NetworkService,NetworkServiceInProcess',
-        '--disable-extensions',
-        '--exclude-switches=enable-automation',
-        '--disable-automation',
-        `--user-agent=${fingerprint.userAgent}`,
-        `--window-size=${fingerprint.viewport.width},${fingerprint.viewport.height}`,
-        `--lang=${fingerprint.locale}`,
-      ],
-    });
+    let browser, chromeProc;
+
+    if (usingRealChrome) {
+      // Launch Chrome manually and connect via CDP — this is critical for
+      // Turnstile to solve. puppeteer.launch() injects automation markers
+      // that Turnstile detects; manual launch + connect does not.
+      const chromeInfo = await this.launchChromeManually(chromePath, profilePath, fingerprint);
+      chromeProc = chromeInfo.chromeProc;
+      browser = await puppeteer.connect({ browserWSEndpoint: chromeInfo.wsUrl });
+    } else {
+      // Fallback: Puppeteer launch with Electron's Chromium
+      browser = await puppeteer.launch({
+        executablePath: process.execPath,
+        userDataDir: profilePath,
+        headless: false,
+        ignoreDefaultArgs: ['--enable-automation'],
+        ignoreHTTPSErrors: true,
+        args: [
+          '--no-sandbox',
+          '--disable-blink-features=AutomationControlled',
+          '--no-first-run',
+          '--no-default-browser-check',
+          `--window-size=${fingerprint.viewport.width},${fingerprint.viewport.height}`,
+          `--lang=${fingerprint.locale}`,
+        ],
+      });
+    }
 
     try {
       let page = (await browser.pages())[0] || await browser.newPage();
 
-      // Inject stealth script
-      await page.evaluateOnNewDocument(STEALTH_INIT_SCRIPT);
-
       // Set viewport
       await page.setViewport(fingerprint.viewport);
-
-      // Set timezone
-      await page.emulateTimezone(fingerprint.timezone);
 
       // Navigate to target
       this.emit('page_open', {
@@ -400,7 +431,8 @@ class WorkflowRunner {
       return { networkInfo, steps_executed: steps.length };
 
     } finally {
-      await browser.close();
+      try { await browser.close(); } catch {}
+      if (chromeProc) { try { chromeProc.kill(); } catch {} }
       this.emit('page_closed', { workflow_id: workflowId, profile_id: profileId });
     }
   }
