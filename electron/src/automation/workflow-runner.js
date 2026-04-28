@@ -19,6 +19,8 @@ const puppeteer = require('puppeteer-core');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const https = require('https');
+const http = require('http');
 
 // Stealth JS injection — runs on every new page
 const STEALTH_INIT_SCRIPT = `
@@ -319,7 +321,17 @@ class WorkflowRunner {
         });
       }
 
-      // Execute workflow steps
+      // Check if this is a VAPI workflow (auto-detect or explicit)
+      const isVapiWorkflow = config.target_url.includes('dashboard.vapi.ai') ||
+                             config.target_url.includes('vapi.ai/register') ||
+                             (config.workflow_type && config.workflow_type === 'vapi');
+
+      if (isVapiWorkflow) {
+        const vapiResult = await this.executeVapiWorkflow(page, config, workflowId, profileId);
+        return { ...vapiResult, networkInfo: { timezone: fingerprint.timezone, locale: fingerprint.locale, userAgent: fingerprint.userAgent, viewport: fingerprint.viewport } };
+      }
+
+      // Execute generic workflow steps
       const steps = config.steps || [];
       for (const step of steps) {
         if (this.stopped) break;
@@ -480,6 +492,524 @@ class WorkflowRunner {
     } catch {
       // ignore
     }
+  }
+
+  // ═══════════════════════════════════════════════════
+  // VAPI AI Registration Workflow — Full automation
+  // ═══════════════════════════════════════════════════
+
+  async executeVapiWorkflow(page, config, workflowId, profileId) {
+    const creds = config.credentials || {};
+    const email = creds.email;
+    const password = creds.password;
+    const promoCode = creds.promo_code || creds.promoCode || '';
+    const mailgunApiKey = creds.mailgun_api_key || creds.mailgunApiKey || '';
+    const mailgunDomain = creds.mailgun_domain || creds.mailgunDomain || '';
+
+    if (!email || !password) {
+      throw new Error('VAPI workflow requires email and password in credentials');
+    }
+
+    const stepsCompleted = [];
+    const timeoutMs = config.selector_timeout_ms || 15000;
+
+    // Helper: wait for selector with logging
+    const waitAndLog = async (selector, label) => {
+      this.emit('selector_fill_attempt', { workflow_id: workflowId, details: { selector, label, status: 'waiting' } });
+      await page.waitForSelector(selector, { timeout: timeoutMs });
+      this.emit('selector_fill_success', { workflow_id: workflowId, details: { selector, label, status: 'found' } });
+    };
+
+    // Helper: human-like delay
+    const humanDelay = (min = 500, max = 1500) => {
+      const ms = Math.floor(Math.random() * (max - min) + min);
+      return new Promise(r => setTimeout(r, ms));
+    };
+
+    // Helper: type with human-like delays
+    const humanType = async (selector, text) => {
+      await page.click(selector, { clickCount: 3 }); // select existing text
+      await humanDelay(100, 300);
+      for (const char of text) {
+        await page.type(selector, char, { delay: Math.floor(Math.random() * 80 + 30) });
+      }
+    };
+
+    try {
+      // ─── STEP 1: Navigate to registration page ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 1, action: 'navigate_register', status: 'starting' });
+
+      const registerUrl = 'https://dashboard.vapi.ai/register';
+      if (!page.url().includes('/register')) {
+        await page.goto(registerUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      }
+      await humanDelay(1000, 2000);
+      this.emit('workflow_step', { workflow_id: workflowId, step: 1, action: 'navigate_register', status: 'success' });
+      stepsCompleted.push('navigate_register');
+
+      // ─── STEP 2: Fill email and password, click Sign Up ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'starting' });
+
+      // Wait for the email input
+      await waitAndLog('input[name="email"]', 'Email input');
+      await humanType('input[name="email"]', email);
+      await humanDelay(300, 600);
+
+      // Fill password
+      await waitAndLog('input[name="password"]', 'Password input');
+      await humanType('input[name="password"]', password);
+      await humanDelay(500, 1000);
+
+      // Click Sign Up button
+      const signUpSelector = 'button[type="submit"]';
+      await waitAndLog(signUpSelector, 'Sign Up button');
+      await page.click(signUpSelector);
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'submitted' });
+
+      // Wait for confirmation message or redirect
+      await humanDelay(3000, 5000);
+
+      // Check if we got a confirmation message or redirected to dashboard
+      const currentUrl = page.url();
+      const pageContent = await page.content();
+      const needsVerification = pageContent.toLowerCase().includes('confirmation') ||
+                                 pageContent.toLowerCase().includes('verify') ||
+                                 pageContent.toLowerCase().includes('check your') ||
+                                 currentUrl.includes('/register');
+
+      stepsCompleted.push('fill_registration');
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'fill_registration', status: 'success', details: { needs_verification: needsVerification } });
+
+      // ─── STEP 2.5: Email verification ───
+      if (needsVerification && mailgunApiKey && mailgunDomain) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2.5, action: 'email_verification', status: 'starting' });
+
+        // Poll Mailgun for verification email (up to 60s)
+        let verificationLink = null;
+        const maxAttempts = 12;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 2.5, action: 'email_verification', status: 'polling', details: { attempt: attempt + 1, max: maxAttempts } });
+
+          verificationLink = await this.fetchVerificationLink(mailgunApiKey, mailgunDomain, email);
+          if (verificationLink) break;
+
+          await new Promise(r => setTimeout(r, 5000)); // Wait 5s between polls
+        }
+
+        if (verificationLink) {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 2.5, action: 'email_verification', status: 'link_found' });
+
+          // Navigate to verification link
+          await page.goto(verificationLink, { waitUntil: 'networkidle2', timeout: 30000 });
+          await humanDelay(3000, 5000);
+          stepsCompleted.push('email_verified');
+          this.emit('workflow_step', { workflow_id: workflowId, step: 2.5, action: 'email_verification', status: 'success' });
+        } else {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 2.5, action: 'email_verification', status: 'no_link_found', details: { message: 'Could not find verification email. Will attempt login anyway.' } });
+        }
+      } else if (needsVerification) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2.5, action: 'email_verification', status: 'skipped', details: { message: 'No Mailgun API key provided. Email verification must be done manually.' } });
+      }
+
+      // ─── STEP 3: Login (if not already on dashboard) ───
+      const afterVerifyUrl = page.url();
+      if (!afterVerifyUrl.includes('/composer') && !afterVerifyUrl.includes('/assistants') && !afterVerifyUrl.includes('/settings')) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'starting' });
+
+        await page.goto('https://dashboard.vapi.ai/login', { waitUntil: 'networkidle2', timeout: 30000 });
+        await humanDelay(1000, 2000);
+
+        // Fill login form
+        await waitAndLog('input[name="email"]', 'Login email');
+        await humanType('input[name="email"]', email);
+        await humanDelay(300, 600);
+
+        await waitAndLog('input[name="password"]', 'Login password');
+        await humanType('input[name="password"]', password);
+        await humanDelay(500, 1000);
+
+        // Click Sign In
+        await waitAndLog('button[type="submit"]', 'Sign In button');
+        await page.click('button[type="submit"]');
+
+        // Wait for dashboard to load
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+        await humanDelay(3000, 5000);
+
+        stepsCompleted.push('login');
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'login', status: 'success' });
+      } else {
+        stepsCompleted.push('login_skipped_already_on_dashboard');
+      }
+
+      // ─── STEP 3.5: Handle onboarding survey (if present) ───
+      await this.handleVapiOnboarding(page, workflowId);
+      stepsCompleted.push('onboarding_handled');
+
+      // ─── STEP 4: Navigate to Billing and apply promo code ───
+      if (promoCode) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'starting' });
+
+        // Navigate to billing page with coupon dialog
+        await page.goto('https://dashboard.vapi.ai/settings/billing?coupon-redemption=true', {
+          waitUntil: 'networkidle2',
+          timeout: 30000,
+        });
+        await humanDelay(2000, 4000);
+
+        // Wait for the coupon code input to appear
+        const couponInputSelector = 'input[name="code"]';
+        try {
+          await page.waitForSelector(couponInputSelector, { timeout: timeoutMs });
+          await humanDelay(500, 1000);
+
+          // Type promo code
+          await humanType(couponInputSelector, promoCode);
+          await humanDelay(500, 1000);
+
+          // Find and click the Redeem button
+          const redeemClicked = await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const redeemBtn = buttons.find(b => b.textContent.trim() === 'Redeem');
+            if (redeemBtn) {
+              redeemBtn.click();
+              return true;
+            }
+            return false;
+          });
+
+          if (redeemClicked) {
+            await humanDelay(3000, 5000);
+
+            // Check credit balance
+            const creditBalance = await page.evaluate(() => {
+              const text = document.body.innerText;
+              const match = text.match(/(\d+(?:\.\d+)?)\s*Credits/);
+              return match ? match[1] : null;
+            });
+
+            stepsCompleted.push('promo_applied');
+            this.emit('workflow_step', {
+              workflow_id: workflowId,
+              step: 4,
+              action: 'apply_promo',
+              status: 'success',
+              details: { promo_code: promoCode, credit_balance: creditBalance },
+            });
+          } else {
+            // Try clicking Apply Coupon button first, then fill
+            const applyCouponClicked = await page.evaluate(() => {
+              const buttons = Array.from(document.querySelectorAll('button'));
+              const applyBtn = buttons.find(b => b.textContent.trim() === 'Apply Coupon');
+              if (applyBtn) {
+                applyBtn.click();
+                return true;
+              }
+              return false;
+            });
+
+            if (applyCouponClicked) {
+              await humanDelay(1000, 2000);
+              await page.waitForSelector(couponInputSelector, { timeout: timeoutMs });
+              await humanType(couponInputSelector, promoCode);
+              await humanDelay(500, 1000);
+
+              await page.evaluate(() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const redeemBtn = buttons.find(b => b.textContent.trim() === 'Redeem');
+                if (redeemBtn) redeemBtn.click();
+              });
+              await humanDelay(3000, 5000);
+              stepsCompleted.push('promo_applied');
+              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'success' });
+            } else {
+              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'failed', details: { message: 'Could not find Redeem or Apply Coupon button' } });
+            }
+          }
+        } catch (err) {
+          // Coupon dialog might not have opened. Try clicking Apply Coupon button first.
+          this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'retrying', details: { message: 'Coupon input not found, trying Apply Coupon button' } });
+
+          await page.goto('https://dashboard.vapi.ai/settings/billing', { waitUntil: 'networkidle2', timeout: 30000 });
+          await humanDelay(2000, 3000);
+
+          const applyCouponClicked = await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const applyBtn = buttons.find(b => b.textContent.trim() === 'Apply Coupon');
+            if (applyBtn) { applyBtn.click(); return true; }
+            return false;
+          });
+
+          if (applyCouponClicked) {
+            await humanDelay(1000, 2000);
+            try {
+              await page.waitForSelector(couponInputSelector, { timeout: timeoutMs });
+              await humanType(couponInputSelector, promoCode);
+              await humanDelay(500, 1000);
+
+              await page.evaluate(() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const redeemBtn = buttons.find(b => b.textContent.trim() === 'Redeem');
+                if (redeemBtn) redeemBtn.click();
+              });
+              await humanDelay(3000, 5000);
+              stepsCompleted.push('promo_applied');
+              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'success' });
+            } catch (innerErr) {
+              this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'failed', details: { error: innerErr.message } });
+            }
+          }
+        }
+      } else {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'apply_promo', status: 'skipped', details: { message: 'No promo code provided' } });
+      }
+
+      // ─── STEP 5: Log out ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'logout', status: 'starting' });
+
+      // Click org menu to reveal Sign out
+      const signedOut = await page.evaluate(() => {
+        // Try clicking the org menu button
+        const menuBtn = document.querySelector('button[name="account-menu-trigger"]');
+        if (menuBtn) {
+          menuBtn.click();
+          return 'menu_opened';
+        }
+        return 'no_menu_button';
+      });
+
+      if (signedOut === 'menu_opened') {
+        await humanDelay(500, 1000);
+
+        // Click Sign out
+        const loggedOut = await page.evaluate(() => {
+          const items = document.querySelectorAll('[aria-label="Sign out"]');
+          if (items.length > 0) {
+            items[0].click();
+            return true;
+          }
+          // Fallback: find by text
+          const allElements = document.querySelectorAll('div[tabindex="0"]');
+          for (const el of allElements) {
+            if (el.textContent.trim() === 'Sign out') {
+              el.click();
+              return true;
+            }
+          }
+          return false;
+        });
+
+        if (loggedOut) {
+          await humanDelay(2000, 4000);
+          stepsCompleted.push('logout');
+          this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'logout', status: 'success' });
+        } else {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'logout', status: 'failed', details: { message: 'Could not find Sign out button' } });
+        }
+      }
+
+      return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length };
+
+    } catch (err) {
+      // Capture screenshot on error
+      try {
+        const screenshotPath = path.join(this.screenshotsDir, `vapi_error_${Date.now()}.png`);
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        this.emit('workflow_step', { workflow_id: workflowId, action: 'error_screenshot', details: { path: screenshotPath } });
+      } catch {}
+
+      throw err;
+    }
+  }
+
+  async handleVapiOnboarding(page, workflowId) {
+    // Handle the multi-step onboarding survey that appears after first login
+    try {
+      // Check if "Welcome! Where did you hear about us?" is present
+      const hasOnboarding = await page.evaluate(() => {
+        return document.body.innerText.includes('Where did you hear about us');
+      });
+
+      if (!hasOnboarding) {
+        // Check for monitoring dialog and close it
+        const hasMonitoringDialog = await page.evaluate(() => {
+          const closeBtn = document.querySelector('button[aria-label="Close"]');
+          if (closeBtn) { closeBtn.click(); return true; }
+          return false;
+        });
+        if (hasMonitoringDialog) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+        return;
+      }
+
+      this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'onboarding_survey', status: 'starting' });
+
+      // Close any monitoring dialog first
+      await page.evaluate(() => {
+        const closeBtn = document.querySelector('button[aria-label="Close"]');
+        if (closeBtn) closeBtn.click();
+      });
+      await new Promise(r => setTimeout(r, 500));
+
+      // Step 1: Select "Twitter" (or any option) for "Where did you hear about us?"
+      const selectedSource = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const twitterBtn = buttons.find(b => b.textContent.includes('Twitter'));
+        if (twitterBtn) { twitterBtn.click(); return 'Twitter'; }
+        // Fallback: click first option
+        const firstOption = buttons.find(b => b.textContent.includes('Blog'));
+        if (firstOption) { firstOption.click(); return 'Blog'; }
+        return null;
+      });
+
+      if (selectedSource) {
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Click Next
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const nextBtn = buttons.find(b => b.textContent.trim().startsWith('Next'));
+          if (nextBtn && !nextBtn.disabled) nextBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 1500));
+
+        // Step 2: "What is your role?" — Select Developer
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const devBtn = buttons.find(b => b.textContent.includes('Developer'));
+          if (devBtn) devBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Click Next
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const nextBtn = buttons.find(b => b.textContent.trim().startsWith('Next'));
+          if (nextBtn && !nextBtn.disabled) nextBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 1500));
+
+        // Step 3: "What are you using Vapi for?" — Select Personal Project
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const personalBtn = buttons.find(b => b.textContent.includes('Personal Project'));
+          if (personalBtn) personalBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Click "Get Started"
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const getStartedBtn = buttons.find(b => b.textContent.trim() === 'Get Started');
+          if (getStartedBtn && !getStartedBtn.disabled) getStartedBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Close the "Create an Agent" page if it appears (click X/skip button)
+        await page.evaluate(() => {
+          const skipBtn = document.querySelector('button[aria-label="Skip to dashboard"]');
+          if (skipBtn) skipBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 1000));
+
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'onboarding_survey', status: 'success' });
+      }
+    } catch (err) {
+      this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'onboarding_survey', status: 'skipped', details: { error: err.message } });
+    }
+  }
+
+  async fetchVerificationLink(apiKey, domain, email) {
+    // Fetch stored messages from Mailgun to find the VAPI verification link
+    // The API key and domain are provided by the user at runtime — never hardcoded
+    try {
+      const url = `https://api.mailgun.net/v3/${domain}/events?event=stored&recipient=${encodeURIComponent(email)}&limit=5`;
+
+      const response = await this.httpGet(url, {
+        auth: `api:${apiKey}`,
+      });
+
+      if (response && response.items) {
+        for (const item of response.items) {
+          if (item.storage && item.storage.url) {
+            // Fetch the stored message
+            const message = await this.httpGet(item.storage.url, {
+              auth: `api:${apiKey}`,
+            });
+
+            if (message && message['body-html']) {
+              // Extract verification link from HTML
+              const linkMatch = message['body-html'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s]+/);
+              if (linkMatch) {
+                return linkMatch[0].replace(/&amp;/g, '&');
+              }
+            }
+            if (message && message['body-plain']) {
+              const linkMatch = message['body-plain'].match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^\s]+/);
+              if (linkMatch) {
+                return linkMatch[0];
+              }
+            }
+          }
+        }
+      }
+
+      // Alternative: try stored messages endpoint
+      const storedUrl = `https://api.mailgun.net/v3/${domain}/messages?recipient=${encodeURIComponent(email)}&limit=5`;
+      const storedResponse = await this.httpGet(storedUrl, {
+        auth: `api:${apiKey}`,
+      });
+
+      if (storedResponse && storedResponse.items) {
+        for (const item of storedResponse.items) {
+          const body = item['body-html'] || item['body-plain'] || '';
+          const linkMatch = body.match(/https:\/\/auth\.vapi\.ai\/auth\/v1\/verify\?[^"'\s]+/);
+          if (linkMatch) {
+            return linkMatch[0].replace(/&amp;/g, '&');
+          }
+        }
+      }
+
+      return null;
+    } catch (err) {
+      this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'error', details: { error: err.message } });
+      return null;
+    }
+  }
+
+  httpGet(url, options = {}) {
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const mod = parsedUrl.protocol === 'https:' ? https : http;
+
+      const reqOptions = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: 'GET',
+        headers: {},
+      };
+
+      if (options.auth) {
+        reqOptions.headers['Authorization'] = 'Basic ' + Buffer.from(options.auth).toString('base64');
+      }
+
+      const req = mod.request(reqOptions, (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch {
+            resolve(data);
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.setTimeout(10000, () => { req.destroy(); reject(new Error('Request timeout')); });
+      req.end();
+    });
   }
 
   stop() {

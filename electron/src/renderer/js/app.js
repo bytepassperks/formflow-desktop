@@ -88,6 +88,36 @@ function getCredentials() {
 }
 
 // ═══════════════════════════════════════════════════
+// Preset Workflow Loaders
+// ═══════════════════════════════════════════════════
+document.getElementById('loadVapiPresetBtn').addEventListener('click', () => {
+  // Set target URL and workflow name
+  document.getElementById('targetUrl').value = 'https://dashboard.vapi.ai/register';
+  document.getElementById('workflowName').value = 'VAPI AI Registration';
+
+  // Clear existing credentials and add VAPI-specific ones
+  document.getElementById('credentialsList').innerHTML = '';
+  addCredentialRow('email', '');
+  addCredentialRow('password', '');
+  addCredentialRow('promo_code', 'VAPIHERVOICE');
+  addCredentialRow('mailgun_api_key', '');
+  addCredentialRow('mailgun_domain', '');
+
+  // Clear existing steps (VAPI workflow is auto-detected, no manual steps needed)
+  document.getElementById('stepsBody').innerHTML = '';
+
+  // Set execution settings for single profile
+  document.getElementById('parallelRuns').value = '1';
+  document.getElementById('maxRetries').value = '2';
+  document.getElementById('numProfiles').value = '1';
+  document.getElementById('navTimeout').value = '30000';
+  document.getElementById('selectorTimeout').value = '15000';
+  document.getElementById('actionDelay').value = '500';
+
+  addEvent('app_lifecycle', 'preset_loaded', 'VAPI AI Registration preset loaded — fill in email, password, and Mailgun API key, then click Start.');
+});
+
+// ═══════════════════════════════════════════════════
 // Workflow Steps Management
 // ═══════════════════════════════════════════════════
 const ACTIONS = ['navigate', 'fill', 'click', 'select', 'wait', 'submit', 'check'];
