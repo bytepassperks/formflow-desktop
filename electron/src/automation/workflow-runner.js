@@ -74,6 +74,7 @@ class WorkflowRunner {
     this.screenshotsDir = options.screenshotsDir || path.join(this.logsDir, 'screenshots');
     this.onEvent = options.onEvent || (() => {});
     this.onProgress = options.onProgress || (() => {});
+    this.onVpnRotate = options.onVpnRotate || null;
     this.stopped = false;
     this.events = [];
 
@@ -1187,9 +1188,38 @@ class WorkflowRunner {
         queued: bulkCount - completed - failed,
       });
 
-      // Brief pause between accounts to avoid rate limiting
+      // Rotate VPN between accounts for different IP per registration
       if (account.index < bulkCount && !this.stopped) {
-        await new Promise(r => setTimeout(r, 2000));
+        if (this.onVpnRotate && config.vpn_auto_rotate !== false) {
+          this.emit('workflow_step', {
+            action: 'vpn_rotating',
+            status: 'starting',
+            details: { before_account: account.index + 1 },
+          });
+
+          const vpnClient = creds.vpn_client || 'ExpressVPN';
+          const rotateResult = await this.onVpnRotate(vpnClient);
+
+          if (rotateResult && rotateResult.success) {
+            this.emit('workflow_step', {
+              action: 'vpn_rotating',
+              status: 'success',
+              details: { new_location: rotateResult.location, new_ip: rotateResult.ip },
+            });
+          } else {
+            this.emit('workflow_step', {
+              action: 'vpn_rotating',
+              status: 'failed',
+              details: { error: rotateResult ? rotateResult.error : 'VPN rotate returned no result' },
+            });
+          }
+
+          // Wait for VPN to stabilize after rotation
+          await new Promise(r => setTimeout(r, 5000));
+        } else {
+          // Brief pause between accounts even without VPN rotation
+          await new Promise(r => setTimeout(r, 2000));
+        }
       }
     }
 

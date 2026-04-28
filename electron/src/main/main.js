@@ -177,6 +177,47 @@ ipcMain.handle('workflow:run', async (event, params) => {
         mainWindow.webContents.send('workflow:progress', progress);
       }
     },
+    // VPN rotation callback for bulk registration
+    onVpnRotate: async (clientName) => {
+      try {
+        // Find client from scan results
+        const clientInfo = vpnState.detectedClients.find(c => c.name === clientName);
+
+        if (!vpnState.controller || vpnState.activeClient !== clientName) {
+          if (clientInfo) {
+            vpnState.controller = createVPNController(clientInfo);
+          } else {
+            const { VPNController } = require('../vpn/vpn-controller');
+            vpnState.controller = new VPNController(clientName);
+          }
+          vpnState.activeClient = clientName;
+        }
+
+        const result = await vpnState.controller.switchNextLocation();
+
+        // Send VPN event to renderer
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('workflow:event', {
+            timestamp: new Date().toISOString(),
+            event: 'vpn_rotated',
+            status: result.success ? 'success' : 'failed',
+            details: result,
+          });
+
+          if (result.success && result.ip) {
+            mainWindow.webContents.send('workflow:event', {
+              timestamp: new Date().toISOString(),
+              event: 'ip_check_success',
+              ip: result.ip,
+            });
+          }
+        }
+
+        return result;
+      } catch (err) {
+        return { success: false, error: err.message };
+      }
+    },
   });
 
   try {

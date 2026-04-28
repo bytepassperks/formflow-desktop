@@ -123,9 +123,10 @@ document.getElementById('loadVapiPresetBtn').addEventListener('click', () => {
 document.getElementById('bulkModeToggle').addEventListener('change', (e) => {
   const enabled = e.target.checked;
   document.getElementById('bulkCount').disabled = !enabled;
+  document.getElementById('bulkVpnRotate').disabled = !enabled;
   document.getElementById('bulkInfo').style.display = enabled ? 'block' : 'none';
   if (enabled) {
-    addEvent('app_lifecycle', 'bulk_mode_enabled', 'Bulk registration mode enabled. Random emails will be generated for each account.');
+    addEvent('app_lifecycle', 'bulk_mode_enabled', 'Bulk registration mode enabled. Random emails will be generated for each account with auto VPN rotation.');
   }
 });
 
@@ -208,6 +209,7 @@ async function startWorkflow() {
 
   const bulkMode = document.getElementById('bulkModeToggle').checked;
   const bulkCount = parseInt(document.getElementById('bulkCount').value) || 5;
+  const bulkVpnRotate = document.getElementById('bulkVpnRotate').checked;
 
   const params = {
     workflow_config: {
@@ -220,6 +222,7 @@ async function startWorkflow() {
       action_delay_ms: parseInt(document.getElementById('actionDelay').value),
       bulk_mode: bulkMode,
       bulk_count: bulkMode ? bulkCount : 0,
+      vpn_auto_rotate: bulkVpnRotate,
     },
     max_parallel_runs: parseInt(document.getElementById('parallelRuns').value),
     max_retries: parseInt(document.getElementById('maxRetries').value),
