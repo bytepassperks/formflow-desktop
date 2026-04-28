@@ -1,0 +1,53 @@
+{
+  "name": "formflow-desktop-pro",
+  "version": "2.0.0",
+  "description": "Network & Environment-Aware Registration Workflow Testing Studio with embedded stealth Chromium",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "build:dir": "electron-builder --win --dir",
+    "pack": "electron-builder --dir"
+  },
+  "author": "FormFlow",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bytepassperks/formflow-desktop"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.0.0",
+    "node-fetch": "^3.3.2",
+    "uuid": "^10.0.0"
+  },
+  "build": {
+    "appId": "com.formflow.desktop-pro",
+    "productName": "FormFlowDesktopPro",
+    "directories": {
+      "output": "dist"
+    },
+    "publish": null,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "files": [
+      "src/**/*",
+      "node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "profiles",
+        "to": "profiles"
+      }
+    ]
+  }
+}

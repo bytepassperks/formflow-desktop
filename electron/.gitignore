@@ -1,0 +1,11 @@
+node_modules/
+dist/
+profiles/
+logs/
+bundles/
+config/
+*.log
+*.env
+.env*
+secrets.json
+credentials.json
