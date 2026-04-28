@@ -573,9 +573,10 @@ class WorkflowRunner {
       await page.click(selector); // focus the input
       await humanDelay(200, 500);
 
-      // Use nativeInputValueSetter — this bypasses React's controlled component
-      // and directly sets the DOM value, then dispatches native events that
-      // React's synthetic event system picks up correctly
+      // Use nativeInputValueSetter + _valueTracker reset — this is the proven
+      // technique for React controlled components. The _valueTracker reset is
+      // critical: React caches the last value internally, and without resetting
+      // the tracker, React's comparison sees no change and ignores the event.
       await page.evaluate((sel, val) => {
         const input = document.querySelector(sel);
         if (!input) return;
@@ -583,6 +584,9 @@ class WorkflowRunner {
           window.HTMLInputElement.prototype, 'value'
         ).set;
         nativeSetter.call(input, val);
+        // Reset React's internal value tracker so it detects the change
+        const tracker = input._valueTracker;
+        if (tracker) tracker.setValue('');
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
       }, selector, text);
