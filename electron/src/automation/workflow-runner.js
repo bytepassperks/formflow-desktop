@@ -1006,6 +1006,16 @@ class WorkflowRunner {
         auth: `api:${apiKey}`,
       });
 
+      // Check for unauthorized error — this means the user provided a "sending key"
+      // instead of the "Private API key" from Mailgun dashboard
+      if (response && response.Error === 'unauthorized') {
+        this.emit('workflow_step', {
+          workflow_id: 'mailgun', action: 'fetch_verification', status: 'unauthorized',
+          details: { message: 'Mailgun API key does not have permission to read events. Please use the Private API key (not the domain sending key) from Mailgun Dashboard → API Keys.' },
+        });
+        return null;
+      }
+
       this.emit('workflow_step', { workflow_id: 'mailgun', action: 'fetch_verification', status: 'events_response', details: { items_count: response && response.items ? response.items.length : 0 } });
 
       if (response && response.items && response.items.length > 0) {
