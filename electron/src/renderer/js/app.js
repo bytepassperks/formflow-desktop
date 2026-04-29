@@ -118,6 +118,46 @@ document.getElementById('loadVapiPresetBtn').addEventListener('click', () => {
 });
 
 // ═══════════════════════════════════════════════════
+// Speechify Premium Preset Loader
+// ═══════════════════════════════════════════════════
+document.getElementById('loadSpeechifyPresetBtn').addEventListener('click', () => {
+  // Set target URL and workflow name
+  document.getElementById('targetUrl').value = 'https://speechify.com/l/wondertools';
+  document.getElementById('workflowName').value = 'Speechify Premium Registration';
+
+  // Clear existing credentials and add Speechify-specific ones
+  document.getElementById('credentialsList').innerHTML = '';
+  addCredentialRow('email', '');
+  addCredentialRow('password', '007JamesBond@@');
+  addCredentialRow('card_number', '5598880369500915');
+  addCredentialRow('card_expiry', '0927');
+  addCredentialRow('card_cvc', '801');
+  addCredentialRow('promo_code', 'JDKSN292NDKWON');
+  addCredentialRow('mailgun_api_key', '');
+  addCredentialRow('mailgun_domain', 'btedu.tech');
+
+  // Clear existing steps (Speechify workflow is auto-detected)
+  document.getElementById('stepsBody').innerHTML = '';
+
+  // Set execution settings
+  document.getElementById('parallelRuns').value = '1';
+  document.getElementById('maxRetries').value = '2';
+  document.getElementById('numProfiles').value = '1';
+  document.getElementById('navTimeout').value = '30000';
+  document.getElementById('selectorTimeout').value = '15000';
+  document.getElementById('actionDelay').value = '800';
+
+  // Auto-enable bulk mode with 5 accounts
+  document.getElementById('bulkModeToggle').checked = true;
+  document.getElementById('bulkCount').disabled = false;
+  document.getElementById('bulkCount').value = '5';
+  document.getElementById('bulkVpnRotate').disabled = false;
+  document.getElementById('bulkInfo').style.display = 'block';
+
+  addEvent('app_lifecycle', 'preset_loaded', 'Speechify Premium preset loaded with bulk mode (5 accounts). Fill in your Mailgun API key, then click Start.');
+});
+
+// ═══════════════════════════════════════════════════
 // Bulk Registration Mode Toggle
 // ═══════════════════════════════════════════════════
 document.getElementById('bulkModeToggle').addEventListener('change', (e) => {

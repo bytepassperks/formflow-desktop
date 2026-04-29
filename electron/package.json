@@ -51,6 +51,10 @@
       {
         "from": "profiles",
         "to": "profiles"
+      },
+      {
+        "from": "../config",
+        "to": "config"
       }
     ]
   }

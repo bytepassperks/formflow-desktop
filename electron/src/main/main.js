@@ -78,10 +78,13 @@ const APP_ROOT = app.isPackaged
   ? path.dirname(app.getPath('exe'))
   : path.join(__dirname, '..', '..');
 
-const PROFILES_DIR = path.join(APP_ROOT, 'profiles');
+// When packaged, extraResources go to process.resourcesPath
+const RESOURCES_ROOT = app.isPackaged ? process.resourcesPath : APP_ROOT;
+
+const PROFILES_DIR = path.join(RESOURCES_ROOT, 'profiles');
 const LOGS_DIR = path.join(APP_ROOT, 'logs');
 const SCREENSHOTS_DIR = path.join(LOGS_DIR, 'screenshots');
-const CONFIG_DIR = path.join(APP_ROOT, 'config');
+const CONFIG_DIR = path.join(RESOURCES_ROOT, 'config');
 
 // Ensure directories exist
 for (const dir of [PROFILES_DIR, LOGS_DIR, SCREENSHOTS_DIR, CONFIG_DIR]) {
