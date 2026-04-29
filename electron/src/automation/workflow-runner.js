@@ -1075,9 +1075,15 @@ class WorkflowRunner {
       if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
 
       // ─── STEP 3.5: Email verification (only if page requires it) ───
-      // Check if we're already on the payment/promo page — if so, skip verification entirely
-      const postSignupUrl = page.url();
-      const alreadyPastVerification = postSignupUrl.includes('/promo/') || postSignupUrl.includes('paywall') || postSignupUrl.includes('payment');
+      // Check page content (not URL — signup and payment share same URL on Speechify)
+      const pageContent = await page.evaluate(() => {
+        const text = document.body.innerText;
+        return {
+          hasPaymentIndicator: text.includes('$0.00') || text.includes('Discount') || text.includes('100% off') || text.includes('Claim') || text.includes('payment'),
+          hasVerifyPrompt: text.includes('verify your email') || text.includes('check your email') || text.includes('confirmation'),
+        };
+      });
+      const alreadyPastVerification = pageContent.hasPaymentIndicator && !pageContent.hasVerifyPrompt;
 
       if (alreadyPastVerification) {
         this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'skipped', details: { message: 'Already on payment page — verification not required' } });
@@ -1120,19 +1126,29 @@ class WorkflowRunner {
         await humanDelay(2000, 3000);
       }
 
-      // Verify $0.00 pricing is shown
-      const pricingCheck = await page.evaluate(() => {
-        const text = document.body.innerText;
-        return {
-          hasDiscount: text.includes('-100%') || text.includes('100% off'),
-          hasFreePrice: text.includes('$0.00'),
-          hasPromo: text.includes('JDKSN292NDKWON'),
-        };
-      });
+      // Verify $0.00 pricing is shown (poll up to 30s — page may still be loading)
+      let pricingCheck = null;
+      for (let priceWait = 0; priceWait < 15; priceWait++) {
+        pricingCheck = await page.evaluate(() => {
+          const text = document.body.innerText;
+          return {
+            hasDiscount: text.includes('-100%') || text.includes('100% off') || text.includes('save'),
+            hasFreePrice: text.includes('$0.00') || text.includes('$0.00/year'),
+            hasPromo: text.includes('JDKSN292NDKWON'),
+            hasPaymentForm: !!document.querySelector('iframe[src*="stripe.com"]') || text.includes('Card number') || text.includes('Payment'),
+          };
+        });
+
+        if (pricingCheck.hasFreePrice || pricingCheck.hasPaymentForm) break;
+        await new Promise(r => setTimeout(r, 2000));
+      }
 
       this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'payment_page', status: 'price_verified', details: pricingCheck });
 
-      if (!pricingCheck.hasFreePrice) {
+      if (!pricingCheck.hasFreePrice && !pricingCheck.hasPaymentForm) {
+        // Take screenshot before aborting
+        const screenshotPath = path.join(this.screenshotsDir, `no_pricing_${Date.now()}.png`);
+        await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
         throw new Error('Payment page does NOT show $0.00 — aborting to prevent charges');
       }
 
@@ -1519,21 +1535,45 @@ class WorkflowRunner {
 
     this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: 'submitted', details: { button: submitted, email } });
 
-    // Wait for navigation/response
-    await new Promise(r => setTimeout(r, 5000));
+    // Wait for page to transition past signup form (poll up to 60s)
+    // The signup API can take 10-30s depending on network/VPN latency
+    let signupComplete = false;
+    for (let waitStep = 0; waitStep < 30; waitStep++) {
+      await new Promise(r => setTimeout(r, 2000));
 
-    // Verify we're past signup
-    const postSignup = await page.evaluate(() => {
-      const text = document.body.innerText;
-      return {
-        url: window.location.href,
-        hasPayment: text.includes('Payment') || text.includes('$0.00') || text.includes('Discount') || text.includes('Premium'),
-        hasVerification: text.includes('verify') || text.includes('confirmation') || text.includes('check your email'),
-        hasError: text.includes('already exists') || text.includes('invalid') || text.includes('error'),
-      };
-    });
+      const pageCheck = await page.evaluate(() => {
+        const text = document.body.innerText;
+        const hasEmailInput = !!document.querySelector('input[type="email"]');
+        const hasPasswordInput = !!document.querySelector('input[type="password"]');
+        const hasSignupForm = hasEmailInput && hasPasswordInput && text.includes('Create Your Account');
+        const hasPayment = text.includes('$0.00') || text.includes('Discount') || text.includes('100% off') || text.includes('Claim');
+        const hasOnboarding = text.includes('How do you') || text.includes('What would you') || text.includes('want to listen');
+        const hasError = text.includes('already exists') || text.includes('invalid email') || text.includes('Something went wrong');
+        const hasDashboard = text.includes('Dashboard') || text.includes('Welcome');
+        return { hasSignupForm, hasPayment, hasOnboarding, hasError, hasDashboard, url: window.location.href };
+      });
 
-    this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: postSignup.hasError ? 'error' : 'success', details: postSignup });
+      this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: 'waiting', details: { wait_step: waitStep + 1, ...pageCheck } });
+
+      if (pageCheck.hasError) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: 'error', details: pageCheck });
+        throw new Error('Signup error detected — account may already exist');
+      }
+
+      // Success: page moved past signup form
+      if (!pageCheck.hasSignupForm || pageCheck.hasPayment || pageCheck.hasOnboarding || pageCheck.hasDashboard) {
+        signupComplete = true;
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: 'success', details: pageCheck });
+        break;
+      }
+    }
+
+    if (!signupComplete) {
+      // Take screenshot for debugging
+      const screenshotPath = path.join(this.screenshotsDir, `signup_stuck_${Date.now()}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+      throw new Error('Signup form still showing after 60s — account creation may have failed');
+    }
   }
 
   async fillStripePaymentForm(page, browser, cardNumber, cardExpiry, cardCvc, workflowId) {
