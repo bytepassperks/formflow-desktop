@@ -182,6 +182,7 @@ Key features:
 - Creates account with email + password
 - Verifies $0.00 pricing (100% discount via promo `JDKSN292NDKWON`) — aborts if price is not $0
 - Fills Stripe payment form via Chrome DevTools Protocol (CDP) WebSocket connection to cross-origin iframe
+- **reCAPTCHA v2 auto-solve**: Solves via audio challenge (download MP3 → speech-to-text → enter text → verify). Falls back to manual solve with 120s timeout if audio fails
 - Submits payment and verifies dashboard access
 - Supports Mailgun email verification relay at `btedu.tech`
 

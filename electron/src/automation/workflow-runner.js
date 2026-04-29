@@ -1155,17 +1155,83 @@ class WorkflowRunner {
       if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
 
       // ─── STEP 6: Submit payment (click Buy Now) ───
+      // Clicking "Buy Now" may trigger a reCAPTCHA v2 challenge.
+      // Strategy: click Buy Now → detect reCAPTCHA → solve via audio challenge → click Buy Now again.
       this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'submit_payment', status: 'starting' });
 
-      const submitted = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button'));
-        const buyBtn = buttons.find(b => b.textContent.includes('Buy Now'));
-        if (buyBtn) { buyBtn.click(); return true; }
-        return false;
-      });
+      const clickBuyNow = async () => {
+        return page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const buyBtn = buttons.find(b => b.textContent.includes('Buy Now'));
+          if (buyBtn) { buyBtn.click(); return true; }
+          return false;
+        });
+      };
+
+      const submitted = await clickBuyNow();
 
       if (submitted) {
-        await humanDelay(5000, 10000);
+        await humanDelay(3000, 5000);
+
+        // Check if reCAPTCHA appeared after clicking Buy Now
+        const recaptchaDetected = await page.evaluate(() => {
+          const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+          for (const iframe of iframes) {
+            const rect = iframe.getBoundingClientRect();
+            if (rect.width > 50 && rect.height > 50) return true;
+          }
+          return false;
+        });
+
+        if (recaptchaDetected) {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'detected' });
+
+          // Solve reCAPTCHA via audio challenge using CDP
+          const cdpPort = new URL(browser.wsEndpoint()).port;
+          const recaptchaSolved = await this.solveRecaptchaViaAudio(cdpPort, workflowId);
+
+          if (recaptchaSolved) {
+            this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'solved' });
+            await humanDelay(1000, 2000);
+            // Click Buy Now again now that reCAPTCHA is solved
+            await clickBuyNow();
+          } else {
+            // Audio solve failed — wait for manual solve (user completes captcha in the app window)
+            this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'waiting_manual', details: { message: 'Audio solve failed — please solve the captcha manually in the app window' } });
+
+            // Poll for up to 120 seconds for user to solve manually
+            const manualTimeout = 120000;
+            const pollInterval = 3000;
+            const startTime = Date.now();
+            let manuallySolved = false;
+
+            while (Date.now() - startTime < manualTimeout && !this.stopped) {
+              await humanDelay(pollInterval, pollInterval + 500);
+              const stillVisible = await page.evaluate(() => {
+                const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+                for (const iframe of iframes) {
+                  const rect = iframe.getBoundingClientRect();
+                  if (rect.width > 50 && rect.height > 50) return true;
+                }
+                return false;
+              });
+              if (!stillVisible) { manuallySolved = true; break; }
+            }
+
+            if (manuallySolved) {
+              this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'solved_manually' });
+              await humanDelay(1000, 2000);
+              await clickBuyNow();
+            } else {
+              throw new Error('reCAPTCHA was not solved within 120 seconds');
+            }
+          }
+
+          await humanDelay(5000, 10000);
+        } else {
+          // No reCAPTCHA — just wait for payment processing
+          await humanDelay(3000, 7000);
+        }
 
         // Check for success indicators
         const postPayment = await page.evaluate(() => {
@@ -1450,9 +1516,11 @@ class WorkflowRunner {
     });
 
     // Find the Stripe iframe target with card input fields
+    // Stripe uses various iframe URLs — match any stripe.com iframe, then verify
+    // which one actually has card inputs via CDP check
     const stripeTargets = targets.filter(t =>
       t.type === 'iframe' && t.url && t.url.includes('stripe.com') &&
-      t.url.includes('elements-inner')
+      (t.url.includes('elements-inner') || t.url.includes('payment'))
     );
 
     let stripeWsUrl = null;
@@ -1617,6 +1685,271 @@ class WorkflowRunner {
       ws.on('error', (err) => { reject(err); });
       timeout = setTimeout(() => { ws.close(); reject(new Error('Stripe CDP fill timeout')); }, 30000);
     });
+  }
+
+  async solveRecaptchaViaAudio(cdpPort, workflowId) {
+    // Solve reCAPTCHA v2 via audio challenge:
+    // 1. Find the reCAPTCHA bframe (challenge) and anchor (checkbox) CDP targets
+    // 2. Click the checkbox to trigger the challenge
+    // 3. Switch to audio mode
+    // 4. Download the audio MP3
+    // 5. Transcribe via Google Speech Recognition API
+    // 6. Enter the transcription and verify
+    const WebSocket = require('ws');
+
+    const cdpEval = (wsUrl, expression) => {
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
+        let msgId = 1;
+        const timeout = setTimeout(() => { ws.close(); reject(new Error('CDP eval timeout')); }, 15000);
+
+        ws.on('open', () => {
+          ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.enable' }));
+          ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }));
+        });
+
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data);
+          if (msg.id === 2 && msg.result) {
+            clearTimeout(timeout);
+            ws.close();
+            resolve(msg.result.result ? msg.result.result.value : null);
+          }
+        });
+
+        ws.on('error', (err) => { clearTimeout(timeout); reject(err); });
+      });
+    };
+
+    try {
+      // Discover CDP targets
+      const targets = await new Promise((resolve, reject) => {
+        http.get(`http://127.0.0.1:${cdpPort}/json`, (res) => {
+          let data = '';
+          res.on('data', c => data += c);
+          res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+        }).on('error', reject);
+      });
+
+      // Find reCAPTCHA anchor (checkbox) and bframe (challenge) targets
+      const anchorTargets = targets.filter(t => t.type === 'iframe' && t.url && t.url.includes('recaptcha') && t.url.includes('anchor') && t.webSocketDebuggerUrl);
+      const bframeTargets = targets.filter(t => t.type === 'iframe' && t.url && t.url.includes('recaptcha') && t.url.includes('bframe') && t.webSocketDebuggerUrl);
+
+      if (anchorTargets.length === 0) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'error', details: { message: 'No reCAPTCHA anchor iframe found' } });
+        return false;
+      }
+
+      // Click the reCAPTCHA checkbox in the anchor iframe
+      for (const anchor of anchorTargets) {
+        try {
+          const result = await cdpEval(anchor.webSocketDebuggerUrl, `(() => {
+            const cb = document.querySelector('.recaptcha-checkbox-border') || document.querySelector('#recaptcha-anchor');
+            if (cb) { cb.click(); return 'clicked'; }
+            return 'not_found';
+          })()`);
+          if (result === 'clicked') break;
+        } catch { /* try next anchor */ }
+      }
+
+      await new Promise(r => setTimeout(r, 3000));
+
+      // Re-fetch targets (bframe may have updated)
+      const targets2 = await new Promise((resolve, reject) => {
+        http.get(`http://127.0.0.1:${cdpPort}/json`, (res) => {
+          let data = '';
+          res.on('data', c => data += c);
+          res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+        }).on('error', reject);
+      });
+
+      const bframes = targets2.filter(t => t.type === 'iframe' && t.url && t.url.includes('recaptcha') && t.url.includes('bframe') && t.webSocketDebuggerUrl);
+      if (bframes.length === 0) {
+        // No bframe means the checkbox auto-solved (no challenge)
+        return true;
+      }
+
+      const bframeWs = bframes[0].webSocketDebuggerUrl;
+
+      // Switch to audio challenge
+      const audioClicked = await cdpEval(bframeWs, `(() => {
+        const btn = document.querySelector('#recaptcha-audio-button');
+        if (btn) { btn.click(); return 'clicked'; }
+        return 'not_found';
+      })()`);
+
+      if (audioClicked !== 'clicked') {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'error', details: { message: 'Audio button not found' } });
+        return false;
+      }
+
+      await new Promise(r => setTimeout(r, 2000));
+
+      // Get the audio download URL
+      const audioUrl = await cdpEval(bframeWs, `(() => {
+        const link = document.querySelector('.rc-audiochallenge-tdownload-link');
+        if (link) return link.href;
+        const src = document.querySelector('#audio-source');
+        if (src) return src.src;
+        return null;
+      })()`);
+
+      if (!audioUrl) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'error', details: { message: 'Audio URL not found' } });
+        return false;
+      }
+
+      this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'transcribing' });
+
+      // Download the audio MP3 and transcribe via Google Speech Recognition
+      const transcription = await this.transcribeRecaptchaAudio(audioUrl);
+
+      if (!transcription) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'error', details: { message: 'Transcription failed' } });
+        return false;
+      }
+
+      // Enter the transcription and click Verify
+      await cdpEval(bframeWs, `(() => {
+        const input = document.querySelector('#audio-response');
+        if (!input) return 'input_not_found';
+        input.focus();
+        input.value = '';
+        document.execCommand('insertText', false, ${JSON.stringify(transcription)});
+        return 'filled';
+      })()`);
+
+      await new Promise(r => setTimeout(r, 500));
+
+      await cdpEval(bframeWs, `(() => {
+        const btn = document.querySelector('#recaptcha-verify-button');
+        if (btn) { btn.click(); return 'clicked'; }
+        return 'not_found';
+      })()`);
+
+      await new Promise(r => setTimeout(r, 3000));
+
+      // Check if solved (look for green checkmark in anchor)
+      for (const anchor of anchorTargets) {
+        try {
+          const checked = await cdpEval(anchor.webSocketDebuggerUrl, `(() => {
+            const cb = document.querySelector('.recaptcha-checkbox-checked, .recaptcha-checkbox-checkmark');
+            return cb ? 'solved' : 'not_solved';
+          })()`);
+          if (checked === 'solved') return true;
+        } catch { /* continue */ }
+      }
+
+      // Also re-check bframe for error/new challenge
+      try {
+        const status = await cdpEval(bframeWs, `(() => {
+          const err = document.querySelector('.rc-audiochallenge-error-message');
+          if (err && err.offsetHeight > 0) return 'error: ' + err.textContent;
+          return 'unknown';
+        })()`);
+        this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'retry_needed', details: { message: status } });
+      } catch { /* bframe may have closed */ }
+
+      return false;
+    } catch (err) {
+      this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'solve_recaptcha', status: 'error', details: { message: err.message } });
+      return false;
+    }
+  }
+
+  async transcribeRecaptchaAudio(audioUrl) {
+    // Download reCAPTCHA audio MP3 and convert to WAV, then send to
+    // Google Web Speech API for transcription.
+    // Uses native Node.js + sox/ffmpeg for conversion.
+    const os = require('os');
+    const tmpFile = path.join(os.tmpdir(), `recaptcha_audio_${Date.now()}`);
+    const mp3Path = tmpFile + '.mp3';
+    const wavPath = tmpFile + '.wav';
+
+    try {
+      // Download the MP3
+      await new Promise((resolve, reject) => {
+        const proto = audioUrl.startsWith('https') ? https : http;
+        proto.get(audioUrl, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            proto.get(res.headers.location, (res2) => {
+              const fileStream = fs.createWriteStream(mp3Path);
+              res2.pipe(fileStream);
+              fileStream.on('finish', () => { fileStream.close(); resolve(); });
+            }).on('error', reject);
+          } else {
+            const fileStream = fs.createWriteStream(mp3Path);
+            res.pipe(fileStream);
+            fileStream.on('finish', () => { fileStream.close(); resolve(); });
+          }
+        }).on('error', reject);
+      });
+
+      // Convert MP3 to WAV using ffmpeg (commonly available) or sox
+      await new Promise((resolve, reject) => {
+        const ffmpeg = spawn('ffmpeg', ['-i', mp3Path, '-ar', '16000', '-ac', '1', '-y', wavPath]);
+        ffmpeg.on('close', (code) => {
+          if (code === 0) resolve();
+          else {
+            // Fallback to sox
+            const sox = spawn('sox', [mp3Path, '-r', '16000', '-c', '1', wavPath]);
+            sox.on('close', (c2) => c2 === 0 ? resolve() : reject(new Error('Audio conversion failed')));
+            sox.on('error', () => reject(new Error('Neither ffmpeg nor sox available for audio conversion')));
+          }
+        });
+        ffmpeg.on('error', () => {
+          const sox = spawn('sox', [mp3Path, '-r', '16000', '-c', '1', wavPath]);
+          sox.on('close', (c2) => c2 === 0 ? resolve() : reject(new Error('Audio conversion failed')));
+          sox.on('error', () => reject(new Error('Neither ffmpeg nor sox available for audio conversion')));
+        });
+      });
+
+      // Read WAV file and send to Google Speech Recognition API
+      const audioData = fs.readFileSync(wavPath);
+      const base64Audio = audioData.toString('base64');
+
+      const transcription = await new Promise((resolve, reject) => {
+        const postData = JSON.stringify({
+          config: { encoding: 'LINEAR16', sampleRateHertz: 16000, languageCode: 'en-US' },
+          audio: { content: base64Audio },
+        });
+
+        const req = https.request({
+          hostname: 'speech.googleapis.com',
+          path: '/v1/speech:recognize?key=AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        }, (res) => {
+          let data = '';
+          res.on('data', c => data += c);
+          res.on('end', () => {
+            try {
+              const result = JSON.parse(data);
+              if (result.results && result.results.length > 0) {
+                resolve(result.results[0].alternatives[0].transcript);
+              } else {
+                // Fallback: try with free web API
+                resolve(null);
+              }
+            } catch { resolve(null); }
+          });
+        });
+
+        req.on('error', () => resolve(null));
+        req.write(postData);
+        req.end();
+      });
+
+      // Clean up temp files
+      try { fs.unlinkSync(mp3Path); } catch {}
+      try { fs.unlinkSync(wavPath); } catch {}
+
+      return transcription;
+    } catch (err) {
+      try { fs.unlinkSync(mp3Path); } catch {}
+      try { fs.unlinkSync(wavPath); } catch {}
+      return null;
+    }
   }
 
   async fetchSpeechifyVerificationLink(apiKey, domain, email) {

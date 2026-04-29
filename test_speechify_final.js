@@ -215,16 +215,60 @@ const MAILGUN_DOMAIN = 'btedu.tech';
       console.log('  Available iframe targets:', stripeTargets.length);
     }
 
-    // ─── STEP 6: Submit payment ───
+    // ─── STEP 6: Submit payment (with reCAPTCHA handling) ───
     console.log('[Step 6] Clicking Buy Now...');
-    const buyClicked = await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button'));
-      const buyBtn = btns.find(b => b.textContent.includes('Buy Now'));
-      if (buyBtn) { buyBtn.click(); return true; }
-      return false;
-    });
+    const clickBuyNow = async () => {
+      return page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const buyBtn = btns.find(b => b.textContent.includes('Buy Now'));
+        if (buyBtn) { buyBtn.click(); return true; }
+        return false;
+      });
+    };
+
+    const buyClicked = await clickBuyNow();
 
     if (buyClicked) {
+      console.log('  Waiting to check for reCAPTCHA...');
+      await new Promise(r => setTimeout(r, 4000));
+
+      // Check if reCAPTCHA appeared
+      const hasRecaptcha = await page.evaluate(() => {
+        const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+        for (const iframe of iframes) {
+          const rect = iframe.getBoundingClientRect();
+          if (rect.width > 50 && rect.height > 50) return true;
+        }
+        return false;
+      });
+
+      if (hasRecaptcha) {
+        console.log('  reCAPTCHA detected! Solving via audio challenge...');
+        const cdpPort = new URL(browser.wsEndpoint()).port;
+        const solved = await solveRecaptchaAudio(cdpPort);
+        if (solved) {
+          console.log('  reCAPTCHA solved! Clicking Buy Now again...');
+          await new Promise(r => setTimeout(r, 1000));
+          await clickBuyNow();
+        } else {
+          console.log('  Audio solve failed — waiting 120s for manual solve...');
+          // Poll for manual solve
+          const start = Date.now();
+          while (Date.now() - start < 120000) {
+            await new Promise(r => setTimeout(r, 3000));
+            const still = await page.evaluate(() => {
+              const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+              for (const iframe of iframes) {
+                const rect = iframe.getBoundingClientRect();
+                if (rect.width > 50 && rect.height > 50) return true;
+              }
+              return false;
+            });
+            if (!still) { console.log('  Manually solved!'); await clickBuyNow(); break; }
+          }
+        }
+      }
+
       console.log('  Waiting for payment processing...');
       await new Promise(r => setTimeout(r, 10000));
 
@@ -402,4 +446,133 @@ function fillStripeFields(wsUrl, cardNumber, cardExpiry, cardCvc) {
 
     ws.on('error', (err) => { clearTimeout(timeout); reject(err); });
   });
+}
+
+async function solveRecaptchaAudio(cdpPort) {
+  const WebSocket = require('./electron/node_modules/ws');
+  const fs = require('fs');
+  const path = require('path');
+  const { spawn } = require('child_process');
+
+  const cdpEval = (wsUrl, expression) => {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(wsUrl);
+      let msgId = 1;
+      const timeout = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 15000);
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.enable' }));
+        ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }));
+      });
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data);
+        if (msg.id === 2 && msg.result) { clearTimeout(timeout); ws.close(); resolve(msg.result.result ? msg.result.result.value : null); }
+      });
+      ws.on('error', (err) => { clearTimeout(timeout); reject(err); });
+    });
+  };
+
+  try {
+    // Find reCAPTCHA targets
+    const targets = await httpGetJson(`http://127.0.0.1:${cdpPort}/json`);
+    const anchors = targets.filter(t => t.type === 'iframe' && t.url && t.url.includes('recaptcha') && t.url.includes('anchor') && t.webSocketDebuggerUrl);
+    const bframes = targets.filter(t => t.type === 'iframe' && t.url && t.url.includes('recaptcha') && t.url.includes('bframe') && t.webSocketDebuggerUrl);
+
+    // Click checkbox
+    for (const a of anchors) {
+      try {
+        const r = await cdpEval(a.webSocketDebuggerUrl, `(() => { const cb = document.querySelector('.recaptcha-checkbox-border'); if (cb) { cb.click(); return 'clicked'; } return 'not_found'; })()`);
+        if (r === 'clicked') break;
+      } catch {}
+    }
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Re-fetch bframe targets
+    const t2 = await httpGetJson(`http://127.0.0.1:${cdpPort}/json`);
+    const bf = t2.filter(t => t.type === 'iframe' && t.url && t.url.includes('recaptcha') && t.url.includes('bframe') && t.webSocketDebuggerUrl);
+    if (bf.length === 0) return true; // auto-solved
+
+    const bfWs = bf[0].webSocketDebuggerUrl;
+
+    // Switch to audio
+    await cdpEval(bfWs, `(() => { const btn = document.querySelector('#recaptcha-audio-button'); if (btn) { btn.click(); return 'ok'; } return 'no'; })()`);
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Get audio URL
+    const audioUrl = await cdpEval(bfWs, `(() => { const l = document.querySelector('.rc-audiochallenge-tdownload-link'); if (l) return l.href; const s = document.querySelector('#audio-source'); if (s) return s.src; return null; })()`);
+    if (!audioUrl) { console.log('  No audio URL found'); return false; }
+
+    // Download audio
+    const tmpMp3 = path.join('/tmp', `recaptcha_${Date.now()}.mp3`);
+    const tmpWav = path.join('/tmp', `recaptcha_${Date.now()}.wav`);
+
+    await new Promise((resolve, reject) => {
+      const proto = audioUrl.startsWith('https') ? https : http;
+      proto.get(audioUrl, (res) => {
+        const f = fs.createWriteStream(tmpMp3);
+        res.pipe(f);
+        f.on('finish', () => { f.close(); resolve(); });
+      }).on('error', reject);
+    });
+
+    // Convert to WAV
+    await new Promise((resolve, reject) => {
+      const p = spawn('ffmpeg', ['-i', tmpMp3, '-ar', '16000', '-ac', '1', '-y', tmpWav]);
+      p.on('close', (code) => code === 0 ? resolve() : reject(new Error('ffmpeg failed')));
+      p.on('error', () => reject(new Error('ffmpeg not found')));
+    });
+
+    // Transcribe via Google Speech API
+    const audioData = fs.readFileSync(tmpWav);
+    const postData = JSON.stringify({
+      config: { encoding: 'LINEAR16', sampleRateHertz: 16000, languageCode: 'en-US' },
+      audio: { content: audioData.toString('base64') },
+    });
+
+    const transcription = await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'speech.googleapis.com',
+        path: '/v1/speech:recognize?key=AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      }, (res) => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => {
+          try {
+            const r = JSON.parse(d);
+            resolve(r.results && r.results.length > 0 ? r.results[0].alternatives[0].transcript : null);
+          } catch { resolve(null); }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.write(postData);
+      req.end();
+    });
+
+    try { fs.unlinkSync(tmpMp3); } catch {}
+    try { fs.unlinkSync(tmpWav); } catch {}
+
+    if (!transcription) { console.log('  Transcription failed'); return false; }
+    console.log('  Transcription:', transcription);
+
+    // Enter answer and verify
+    await cdpEval(bfWs, `(() => { const i = document.querySelector('#audio-response'); if (!i) return; i.focus(); i.value = ''; document.execCommand('insertText', false, ${JSON.stringify(transcription)}); })()`);
+    await new Promise(r => setTimeout(r, 500));
+    await cdpEval(bfWs, `(() => { const b = document.querySelector('#recaptcha-verify-button'); if (b) b.click(); })()`);
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Check if solved
+    for (const a of anchors) {
+      try {
+        const c = await cdpEval(a.webSocketDebuggerUrl, `(() => { const cb = document.querySelector('.recaptcha-checkbox-checked'); return cb ? 'solved' : 'not'; })()`);
+        if (c === 'solved') return true;
+      } catch {}
+    }
+
+    return false;
+  } catch (err) {
+    console.log('  reCAPTCHA audio solve error:', err.message);
+    return false;
+  }
 }
