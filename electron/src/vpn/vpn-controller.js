@@ -220,11 +220,11 @@ class VPNController {
         // ExpressVPN Windows CLI: ExpressVPN.CLI.exe connect "location"
         // CLI is at: C:\Program Files (x86)\ExpressVPN\services\ExpressVPN.CLI.exe
         // Docs: https://expressvpn.com/support/vpn-setup/how-to-use-expressvpn-cli-windows/
-        // App runs as admin (requestedExecutionLevel: requireAdministrator in package.json)
-        // so VPN CLI commands inherit admin privileges — no UAC popup per command.
+        // ExpressVPN CLI needs admin — use gsudo (if available) or PowerShell elevation.
+        // gsudo caches the admin token so UAC only shows once per session.
         const cliExe = this.findExpressVpnCli();
         if (cliExe) {
-          return `"${cliExe}" connect "${location}"`;
+          return `gsudo "${cliExe}" connect "${location}" 2>nul || powershell -Command "Start-Process -FilePath '${cliExe.replace(/'/g, "''")}' -ArgumentList 'connect','${location}' -Verb RunAs -Wait -WindowStyle Hidden"`;
         }
         return null;
       }
@@ -303,7 +303,9 @@ class VPNController {
 
       case 'ExpressVPN': {
         const cliExe = this.findExpressVpnCli();
-        if (cliExe) return `"${cliExe}" disconnect`;
+        if (cliExe) {
+          return `gsudo "${cliExe}" disconnect 2>nul || powershell -Command "Start-Process -FilePath '${cliExe.replace(/'/g, "''")}' -ArgumentList 'disconnect' -Verb RunAs -Wait -WindowStyle Hidden"`;
+        }
         return null;
       }
 
