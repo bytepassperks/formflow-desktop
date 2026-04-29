@@ -1,0 +1,67 @@
+{
+    "app_name": "FormFlow Desktop Pro",
+    "version": "1.1.0",
+    "max_parallel_runs": 3,
+    "max_retries": 2,
+    "vpn_timeout_seconds": 20,
+    "screenshot_on_failure": true,
+    "screenshot_on_captcha": true,
+    "screenshot_on_timeout": true,
+    "log_file": "logs/debug_session.json",
+    "error_log_file": "logs/errors.log",
+    "network_snapshot_file": "logs/network_snapshot.json",
+    "screenshot_dir": "logs/screenshots",
+    "bundle_dir": "bundles",
+    "profiles_dir": "profiles",
+    "browser_dir": "browser",
+    "supported_vpn_clients": ["NordVPN", "Surfshark", "ExpressVPN"],
+    "bundled_browser": {
+        "enabled": true,
+        "revision": "1300313",
+        "stealth_mode": true,
+        "auto_download": false
+    },
+    "vpn_automation": {
+        "auto_connect": true,
+        "auto_rotate": true,
+        "rotation_strategy": "round_robin",
+        "rotate_every_n": 1
+    },
+    "environment_presets": {
+        "timezones": [
+            "Asia/Kolkata",
+            "Europe/Berlin",
+            "America/New_York",
+            "America/Los_Angeles",
+            "Europe/London",
+            "Asia/Tokyo",
+            "Australia/Sydney"
+        ],
+        "locales": [
+            "en-US", "en-GB", "de-DE", "fr-FR", "es-ES",
+            "ja-JP", "hi-IN", "pt-BR", "zh-CN", "ko-KR"
+        ],
+        "viewports": [
+            [1920, 1080],
+            [1366, 768],
+            [1440, 900],
+            [1536, 864],
+            [1280, 720],
+            [1600, 900]
+        ],
+        "color_schemes": ["light", "dark", "no-preference"],
+        "user_agents": [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ]
+    },
+    "workflow_defaults": {
+        "navigation_timeout_ms": 30000,
+        "selector_timeout_ms": 10000,
+        "action_delay_ms": 500,
+        "page_load_wait_ms": 3000
+    }
+}
