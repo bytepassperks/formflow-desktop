@@ -41,7 +41,8 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "requestedExecutionLevel": "requireAdministrator"
     },
     "files": [
       "src/**/*",

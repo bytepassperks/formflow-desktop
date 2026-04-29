@@ -220,7 +220,8 @@ class VPNController {
         // ExpressVPN Windows CLI: ExpressVPN.CLI.exe connect "location"
         // CLI is at: C:\Program Files (x86)\ExpressVPN\services\ExpressVPN.CLI.exe
         // Docs: https://expressvpn.com/support/vpn-setup/how-to-use-expressvpn-cli-windows/
-        // Requires admin elevation.
+        // App runs as admin (requestedExecutionLevel: requireAdministrator in package.json)
+        // so VPN CLI commands inherit admin privileges — no UAC popup per command.
         const cliExe = this.findExpressVpnCli();
         if (cliExe) {
           return `"${cliExe}" connect "${location}"`;

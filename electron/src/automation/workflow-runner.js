@@ -1643,15 +1643,20 @@ class WorkflowRunner {
       let timeout;
 
       ws.on('open', () => {
-        // Enable Runtime and check for inputs
         ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.enable' }));
         ws.send(JSON.stringify({
           id: msgId++,
           method: 'Runtime.evaluate',
           params: {
             expression: `(() => {
-              const inputs = document.querySelectorAll('input');
-              return Array.from(inputs).some(i => i.autocomplete === 'cc-number' || i.name === 'number' || i.name === 'cardnumber');
+              const inputs = Array.from(document.querySelectorAll('input'));
+              const inputInfo = inputs.map(i => ({ name: i.name, type: i.type, autocomplete: i.autocomplete, placeholder: i.placeholder }));
+              const hasCardInput = inputs.some(i =>
+                i.autocomplete === 'cc-number' || i.name === 'number' || i.name === 'cardnumber' ||
+                i.name === 'cardNumber' || i.placeholder.includes('1234') || i.placeholder.includes('card number') ||
+                i.autocomplete === 'cc-name' || i.type === 'tel'
+              );
+              return JSON.stringify({ hasCardInput, inputs: inputInfo });
             })()`,
             returnByValue: true,
           },
@@ -1664,7 +1669,12 @@ class WorkflowRunner {
         if (msg.id === 2 && msg.result && msg.result.result) {
           clearTimeout(timeout);
           ws.close();
-          resolve(!!msg.result.result.value);
+          try {
+            const parsed = JSON.parse(msg.result.result.value);
+            resolve(parsed.hasCardInput);
+          } catch {
+            resolve(false);
+          }
         }
       });
 
@@ -1673,9 +1683,9 @@ class WorkflowRunner {
   }
 
   async fillStripeFieldsViaCDP(wsUrl, cardNumber, cardExpiry, cardCvc) {
-    // Connect to Stripe iframe via WebSocket and fill card fields using
-    // the native input value setter + dispatching input/change events.
-    // This updates Stripe's internal state properly.
+    // Fill Stripe Payment Element fields via CDP using Input.dispatchKeyEvent.
+    // This generates trusted keyboard events that Stripe's React handlers recognize,
+    // ensuring both visual update and internal state change.
     const WebSocket = require('ws');
 
     return new Promise((resolve, reject) => {
@@ -1693,6 +1703,33 @@ class WorkflowRunner {
         });
       };
 
+      const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+      // Type a single character via CDP keyboard events
+      const typeChar = async (char) => {
+        await sendCmd('Input.dispatchKeyEvent', {
+          type: 'keyDown', key: char, text: char, code: `Key${char.toUpperCase()}`, windowsVirtualKeyCode: char.charCodeAt(0),
+        });
+        await sendCmd('Input.dispatchKeyEvent', {
+          type: 'keyUp', key: char, text: char, code: `Key${char.toUpperCase()}`, windowsVirtualKeyCode: char.charCodeAt(0),
+        });
+        await delay(30 + Math.random() * 50); // Human-like delay between keystrokes
+      };
+
+      // Type a string character by character
+      const typeString = async (str) => {
+        for (const char of str) {
+          await typeChar(char);
+        }
+      };
+
+      // Press Tab key to move to next field
+      const pressTab = async () => {
+        await sendCmd('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+        await sendCmd('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+        await delay(200);
+      };
+
       ws.on('message', (data) => {
         const msg = JSON.parse(data);
         if (msg.id && pendingCallbacks[msg.id]) {
@@ -1705,57 +1742,57 @@ class WorkflowRunner {
         try {
           await sendCmd('Runtime.enable');
           await sendCmd('DOM.enable');
+          await sendCmd('Input.enable');
 
-          // Format expiry as "MM / YY"
-          const expMonth = cardExpiry.substring(0, 2);
-          const expYear = cardExpiry.substring(2, 4);
-          const formattedExpiry = `${expMonth} / ${expYear}`;
-
-          // Fill all three fields using native setter + input events
-          const fillResult = await sendCmd('Runtime.evaluate', {
+          // Discover actual input fields in the iframe
+          const discoveryResult = await sendCmd('Runtime.evaluate', {
             expression: `(() => {
-              function fillField(selector, value) {
-                const input = document.querySelector(selector);
-                if (!input) return 'not_found: ' + selector;
-                input.focus();
-                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                nativeSetter.call(input, value);
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                input.dispatchEvent(new Event('blur', { bubbles: true }));
-                return 'filled: ' + input.value;
-              }
-
-              const results = {};
-              results.card = fillField('input[name="number"], input[autocomplete="cc-number"]', '${cardNumber}');
-              results.exp = fillField('input[name="expiry"], input[autocomplete="cc-exp"]', '${formattedExpiry}');
-              results.cvc = fillField('input[name="cvc"], input[autocomplete="cc-csc"]', '${cardCvc}');
-              return JSON.stringify(results);
+              const inputs = Array.from(document.querySelectorAll('input'));
+              return JSON.stringify(inputs.map(i => ({
+                name: i.name, type: i.type, autocomplete: i.autocomplete,
+                placeholder: i.placeholder, id: i.id, className: i.className.substring(0, 50)
+              })));
             })()`,
             returnByValue: true,
           });
 
-          // Also try execCommand('insertText') as an alternative approach
-          // This generates "trusted" input events that Stripe's handlers recognize
+          // Focus the first card-related input field
           await sendCmd('Runtime.evaluate', {
             expression: `(() => {
-              function fillWithExecCommand(selector, value) {
-                const input = document.querySelector(selector);
-                if (!input) return false;
-                input.focus();
-                input.select();
-                document.execCommand('delete');
-                document.execCommand('insertText', false, value);
-                return true;
-              }
-
-              fillWithExecCommand('input[name="number"], input[autocomplete="cc-number"]', '${cardNumber}');
-              fillWithExecCommand('input[name="expiry"], input[autocomplete="cc-exp"]', '${formattedExpiry}');
-              fillWithExecCommand('input[name="cvc"], input[autocomplete="cc-csc"]', '${cardCvc}');
-              return 'done';
+              const inputs = Array.from(document.querySelectorAll('input'));
+              const cardInput = inputs.find(i =>
+                i.autocomplete === 'cc-number' || i.name === 'number' || i.name === 'cardnumber' ||
+                i.name === 'cardNumber' || i.placeholder.includes('1234') || i.type === 'tel'
+              ) || inputs[0];
+              if (cardInput) { cardInput.focus(); cardInput.click(); return cardInput.name || cardInput.autocomplete || 'unknown'; }
+              return null;
             })()`,
             returnByValue: true,
           });
+
+          await delay(300);
+
+          // Type card number character by character
+          await typeString(cardNumber);
+          await delay(500);
+
+          // Tab to expiry field
+          await pressTab();
+          await delay(300);
+
+          // Type expiry (MM/YY format — Stripe auto-formats with slash)
+          const expMonth = cardExpiry.substring(0, 2);
+          const expYear = cardExpiry.substring(2, 4);
+          await typeString(expMonth + expYear);
+          await delay(500);
+
+          // Tab to CVC field
+          await pressTab();
+          await delay(300);
+
+          // Type CVC
+          await typeString(cardCvc);
+          await delay(300);
 
           ws.close();
           resolve();
