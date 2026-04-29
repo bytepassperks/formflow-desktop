@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src *;">
+  <title>FormFlow Desktop Pro</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="app-header">
+    <div class="header-left">
+      <h1 class="app-title">FormFlow Desktop Pro</h1>
+      <span class="app-subtitle">Stealth Chromium Testing Studio</span>
+    </div>
+    <div class="header-right">
+      <span id="chromiumBadge" class="badge badge-green">Chromium Embedded</span>
+      <span id="vpnBadge" class="badge badge-gray">VPN: N/A</span>
+      <span id="ipBadge" class="badge badge-gray">IP: N/A</span>
+    </div>
+  </header>
+
+  <!-- Tab Navigation -->
+  <nav class="tab-nav">
+    <button class="tab-btn active" data-tab="workflow">Workflow</button>
+    <button class="tab-btn" data-tab="browser">Browser</button>
+    <button class="tab-btn" data-tab="vpn">VPN</button>
+    <button class="tab-btn" data-tab="debug">Debug Console</button>
+  </nav>
+
+  <!-- Tab Panels -->
+  <main class="tab-content">
+
+    <!-- ═══ WORKFLOW TAB ═══ -->
+    <div class="tab-panel active" id="tab-workflow">
+      <div class="panel-scroll">
+        <!-- Preset Workflows -->
+        <section class="card">
+          <h2 class="card-title">Quick Start — Preset Workflows</h2>
+          <p class="card-desc">Load a pre-configured workflow template. Fill in your credentials and click Start.</p>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="loadVapiPresetBtn">Load VAPI AI Registration</button>
+            <button class="btn btn-primary" id="loadSpeechifyPresetBtn" style="background: linear-gradient(135deg, #6366f1, #8b5cf6);">Load Speechify Premium</button>
+          </div>
+        </section>
+
+        <!-- Target Config -->
+        <section class="card">
+          <h2 class="card-title">Target Configuration</h2>
+          <div class="form-row">
+            <label>Target URL</label>
+            <input type="url" id="targetUrl" placeholder="https://example.com/register">
+          </div>
+          <div class="form-row">
+            <label>Workflow Name</label>
+            <input type="text" id="workflowName" placeholder="My Registration Workflow">
+          </div>
+        </section>
+
+        <!-- Credentials -->
+        <section class="card">
+          <h2 class="card-title">Credentials</h2>
+          <div id="credentialsList">
+            <div class="credential-row">
+              <input type="text" class="cred-key" placeholder="Key (e.g. email)" value="email">
+              <input type="text" class="cred-value" placeholder="Value">
+              <button class="btn-icon btn-remove-cred" title="Remove">&times;</button>
+            </div>
+            <div class="credential-row">
+              <input type="text" class="cred-key" placeholder="Key (e.g. password)" value="password">
+              <input type="text" class="cred-value" placeholder="Value">
+              <button class="btn-icon btn-remove-cred" title="Remove">&times;</button>
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-full" id="addCredentialBtn">+ Add Credential</button>
+        </section>
+
+        <!-- Workflow Steps -->
+        <section class="card">
+          <h2 class="card-title">Workflow Steps</h2>
+          <table class="steps-table" id="stepsTable">
+            <thead>
+              <tr>
+                <th>Action</th>
+                <th>Selector</th>
+                <th>Value</th>
+                <th>Wait (ms)</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="stepsBody"></tbody>
+          </table>
+          <div class="btn-row">
+            <button class="btn btn-secondary" id="addStepBtn">+ Add Step</button>
+            <button class="btn btn-secondary" id="removeStepBtn">- Remove Selected</button>
+          </div>
+        </section>
+
+        <!-- Bulk Registration Mode -->
+        <section class="card">
+          <h2 class="card-title">Bulk Registration Mode</h2>
+          <p class="card-desc">Auto-generate unique email addresses and register multiple accounts sequentially. Requires Mailgun API key and domain.</p>
+          <div class="settings-grid">
+            <div class="form-row">
+              <label>
+                <input type="checkbox" id="bulkModeToggle"> Enable Bulk Registration
+              </label>
+            </div>
+            <div class="form-row">
+              <label>Number of Accounts</label>
+              <input type="number" id="bulkCount" min="1" max="100" value="5" disabled>
+            </div>
+            <div class="form-row">
+              <label>
+                <input type="checkbox" id="bulkVpnRotate" checked disabled> Auto-rotate VPN between accounts
+              </label>
+            </div>
+          </div>
+          <p class="card-desc" id="bulkInfo" style="display:none; color: #f0ad4e;">
+            Each account gets: new random email → register → verify email → apply promo → logout → <strong>rotate VPN to new location</strong> → repeat. All accounts saved to a JSON log file.
+          </p>
+        </section>
+
+        <!-- Execution Settings -->
+        <section class="card">
+          <h2 class="card-title">Execution Settings</h2>
+          <div class="settings-grid">
+            <div class="form-row">
+              <label>Parallel Runs</label>
+              <input type="number" id="parallelRuns" min="1" max="5" value="3">
+            </div>
+            <div class="form-row">
+              <label>Max Retries</label>
+              <input type="number" id="maxRetries" min="0" max="10" value="2">
+            </div>
+            <div class="form-row">
+              <label>Nav Timeout (ms)</label>
+              <input type="number" id="navTimeout" min="5000" max="120000" value="30000" step="5000">
+            </div>
+            <div class="form-row">
+              <label>Selector Timeout (ms)</label>
+              <input type="number" id="selectorTimeout" min="1000" max="60000" value="10000" step="1000">
+            </div>
+            <div class="form-row">
+              <label>Action Delay (ms)</label>
+              <input type="number" id="actionDelay" min="0" max="10000" value="500" step="100">
+            </div>
+            <div class="form-row">
+              <label>Number of Profiles</label>
+              <input type="number" id="numProfiles" min="1" max="20" value="1">
+            </div>
+          </div>
+        </section>
+
+        <!-- Control Buttons -->
+        <div class="controls-bar">
+          <button class="btn btn-primary btn-large" id="startBtn">Start Workflow</button>
+          <button class="btn btn-danger" id="stopBtn" disabled>Stop</button>
+          <div class="controls-spacer"></div>
+          <button class="btn btn-secondary" id="importConfigBtn">Import Config</button>
+          <button class="btn btn-secondary" id="exportConfigBtn">Export Config</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ BROWSER TAB ═══ -->
+    <div class="tab-panel" id="tab-browser">
+      <div class="panel-scroll">
+        <section class="card">
+          <h2 class="card-title">Embedded Chromium Browser</h2>
+          <div class="status-banner status-green" id="browserStatus">
+            <span class="status-icon">●</span>
+            <div>
+              <strong>Chromium is EMBEDDED in this application</strong>
+              <p>No separate download needed — Electron bundles Chromium automatically.</p>
+            </div>
+          </div>
+
+          <div class="info-grid" id="browserInfo">
+            <div class="info-item">
+              <span class="info-label">Chromium Version</span>
+              <span class="info-value" id="chromiumVersion">Loading...</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Electron Version</span>
+              <span class="info-value" id="electronVersion">Loading...</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Platform</span>
+              <span class="info-value" id="platformInfo">Loading...</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Stealth Flags Applied</span>
+              <span class="info-value" id="stealthFlagsCount">Loading...</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">Custom Launch Flags (Auto-Applied)</h2>
+          <p class="card-desc">These flags are applied at the Electron process level — active for ALL browser windows.</p>
+          <div class="flags-list" id="flagsList"></div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">Anti-Detection Features (Active)</h2>
+          <div class="features-list">
+            <div class="feature-item active"><span class="check">●</span> navigator.webdriver removed</div>
+            <div class="feature-item active"><span class="check">●</span> navigator.plugins spoofed (3 realistic plugins)</div>
+            <div class="feature-item active"><span class="check">●</span> navigator.languages overridden</div>
+            <div class="feature-item active"><span class="check">●</span> chrome.runtime patched</div>
+            <div class="feature-item active"><span class="check">●</span> Permissions API normalized</div>
+            <div class="feature-item active"><span class="check">●</span> WebGL vendor/renderer spoofed</div>
+            <div class="feature-item active"><span class="check">●</span> Automation info bar disabled</div>
+            <div class="feature-item active"><span class="check">●</span> Automation blink features disabled</div>
+            <div class="feature-item active"><span class="check">●</span> Certificate errors ignored</div>
+            <div class="feature-item active"><span class="check">●</span> Sandbox disabled (testing mode)</div>
+            <div class="feature-item active"><span class="check">●</span> Web security relaxed (testing mode)</div>
+            <div class="feature-item active"><span class="check">●</span> Headless indicators removed</div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- ═══ VPN TAB ═══ -->
+    <div class="tab-panel" id="tab-vpn">
+      <div class="panel-scroll">
+        <section class="card">
+          <h2 class="card-title">Detected VPN Clients</h2>
+          <div id="vpnClientsList" class="vpn-clients-list">
+            <p class="muted">Click "Scan" to detect installed VPN clients.</p>
+          </div>
+          <button class="btn btn-secondary btn-full" id="scanVpnBtn">Scan for VPN Clients</button>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">Automation Settings</h2>
+          <div class="form-row">
+            <label class="checkbox-label">
+              <input type="checkbox" id="autoConnectVpn" checked>
+              Auto-connect VPN on workflow start
+            </label>
+          </div>
+          <div class="form-row">
+            <label class="checkbox-label">
+              <input type="checkbox" id="autoRotateVpn" checked>
+              Auto-rotate VPN location between workflows
+            </label>
+          </div>
+          <div class="form-row">
+            <label>Rotation Strategy</label>
+            <select id="rotationStrategy">
+              <option value="round_robin">Round Robin</option>
+              <option value="random">Random</option>
+              <option value="sequential">Sequential</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>Rotate every N workflows</label>
+            <input type="number" id="rotateEveryN" min="1" max="50" value="1">
+          </div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">Manual Connection Control</h2>
+          <div class="form-row">
+            <label>Client</label>
+            <select id="vpnClientSelect"><option value="">No VPN detected</option></select>
+          </div>
+          <div class="form-row">
+            <label>Location</label>
+            <select id="vpnLocationSelect"><option value="">Scan first</option></select>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="vpnConnectBtn">Connect</button>
+            <button class="btn btn-danger" id="vpnDisconnectBtn">Disconnect</button>
+            <button class="btn btn-secondary" id="vpnRotateBtn">Rotate Location</button>
+          </div>
+          <div class="vpn-status" id="vpnStatus">Status: Not connected</div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">Location Rotation Queue</h2>
+          <div id="locationQueue" class="location-queue">
+            <p class="muted">Queue will populate after scanning VPN clients.</p>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- ═══ DEBUG CONSOLE TAB ═══ -->
+    <div class="tab-panel" id="tab-debug">
+      <div class="debug-layout">
+        <!-- Left: Event Stream -->
+        <div class="debug-events">
+          <div class="debug-header">
+            <h2 class="card-title">Live Event Stream</h2>
+            <div class="debug-controls">
+              <button class="btn btn-sm" id="clearEventsBtn">Clear</button>
+              <button class="btn btn-sm" id="exportLogsBtn">Export Logs</button>
+              <button class="btn btn-sm" id="openScreenshotsBtn">Screenshots</button>
+              <button class="btn btn-sm" id="generateBundleBtn">Debug Bundle</button>
+            </div>
+          </div>
+          <div class="event-filters">
+            <button class="filter-btn active" data-filter="all">All</button>
+            <button class="filter-btn" data-filter="app_lifecycle">App</button>
+            <button class="filter-btn" data-filter="browser">Browser</button>
+            <button class="filter-btn" data-filter="selector">Selector</button>
+            <button class="filter-btn" data-filter="vpn">VPN</button>
+            <button class="filter-btn" data-filter="network">Network</button>
+            <button class="filter-btn" data-filter="captcha">CAPTCHA</button>
+            <button class="filter-btn" data-filter="retry">Retry</button>
+          </div>
+          <div class="events-list" id="eventsList"></div>
+        </div>
+
+        <!-- Right: Timeline -->
+        <div class="debug-timeline">
+          <h2 class="card-title">Execution Timeline</h2>
+          <div class="timeline" id="timeline"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Progress Bar -->
+  <footer class="progress-bar-container">
+    <span class="progress-label" id="progressLabel">Ready</span>
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+    </div>
+    <span class="progress-pct" id="progressPct">0%</span>
+  </footer>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

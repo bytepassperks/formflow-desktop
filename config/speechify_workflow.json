@@ -1,0 +1,53 @@
+{
+  "name": "Speechify Premium Registration",
+  "description": "Automated Speechify onboarding, account creation, and $0 premium subscription via promo code JDKSN292NDKWON",
+  "workflow_type": "speechify",
+  "target_url": "https://speechify.com/l/wondertools",
+  "navigation_timeout_ms": 60000,
+  "selector_timeout_ms": 15000,
+  "action_delay_ms": 800,
+  "credentials": {
+    "email": "{{email}}",
+    "password": "{{password}}",
+    "card_number": "{{card_number}}",
+    "card_expiry": "{{card_expiry}}",
+    "card_cvc": "{{card_cvc}}",
+    "mailgun_api_key": "{{mailgun_api_key}}",
+    "mailgun_domain": "{{mailgun_domain}}"
+  },
+  "credential_defaults": {
+    "password": "007JamesBond@@",
+    "card_number": "5598880369500915",
+    "card_expiry": "0927",
+    "card_cvc": "801",
+    "mailgun_domain": "btedu.tech"
+  },
+  "promo": {
+    "code": "JDKSN292NDKWON",
+    "discount": "100%",
+    "price_id": "price_1QpTYsBtf7hakIXChv4GUhEG",
+    "due_today": "$0.00",
+    "renewal_price": "$139.00/year",
+    "safety_check": "Abort if payment page does NOT show $0.00"
+  },
+  "steps_overview": [
+    { "step": 1, "action": "navigate_landing", "description": "Navigate to speechify.com/l/wondertools promo page" },
+    { "step": 2, "action": "onboarding_questions", "description": "Answer multi-step onboarding questions (use case, listening preferences)" },
+    { "step": 3, "action": "create_account", "description": "Fill email + password signup form" },
+    { "step": 3.5, "action": "email_verification", "description": "Poll Mailgun for verification email (if required)" },
+    { "step": 4, "action": "payment_page", "description": "Verify $0.00 pricing with 100% discount promo" },
+    { "step": 5, "action": "fill_payment", "description": "Fill Stripe payment form via CDP (cross-origin iframe)" },
+    { "step": 6, "action": "submit_payment", "description": "Click Buy Now to submit $0.00 payment" },
+    { "step": 7, "action": "verify_dashboard", "description": "Confirm Speechify dashboard is accessible" },
+    { "step": 8, "action": "logout", "description": "Sign out of account" }
+  ],
+  "bulk_mode": false,
+  "bulk_count": 0,
+  "notes": [
+    "Stripe payment form is inside a cross-origin iframe — requires CDP WebSocket connection to fill",
+    "Payment is $0.00 for first year due to 100% promo discount",
+    "After first year, renews at $139.00/year — cancel before renewal to avoid charges",
+    "Trial cards 5598880369500915 and 5598880369504446 are used for $0 transactions",
+    "Mailgun relay at btedu.tech captures verification emails"
+  ]
+}

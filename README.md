@@ -107,7 +107,8 @@ formflow-desktop/
 │   └── bundle_exporter.py          # Debug bundle generator
 ├── config/
 │   ├── config_manager.py           # Configuration loader
-│   └── default_config.json         # Default application config
+│   ├── default_config.json         # Default application config
+│   └── speechify_workflow.json     # Speechify workflow configuration
 ├── utils/
 │   └── helpers.py                  # Common utility functions
 ├── profiles/                        # Browser profile data
@@ -163,6 +164,27 @@ pyinstaller formflow.spec
 
 # Output: dist/FormFlowDesktopPro.exe
 ```
+
+## Supported Service Integrations
+
+### VAPI AI
+Automated registration, Turnstile CAPTCHA handling, Supabase API signup, email verification via Mailgun, promo code application, and dashboard login.
+
+### Speechify Premium
+Automated onboarding flow, account creation, Stripe payment form filling via CDP (cross-origin iframe), $0 promo subscription, and dashboard verification.
+
+**Speechify workflow config:** `config/speechify_workflow.json`
+**Speechify test script:** `test_speechify_final.js`
+
+Key features:
+- Navigates `speechify.com/l/wondertools` promo landing
+- Answers multi-step onboarding questions automatically
+- Creates account with email + password
+- Verifies $0.00 pricing (100% discount via promo `JDKSN292NDKWON`) — aborts if price is not $0
+- Fills Stripe payment form via Chrome DevTools Protocol (CDP) WebSocket connection to cross-origin iframe
+- **reCAPTCHA v2 auto-solve**: Solves via audio challenge (download MP3 → speech-to-text → enter text → verify). Falls back to manual solve with 120s timeout if audio fails
+- Submits payment and verifies dashboard access
+- Supports Mailgun email verification relay at `btedu.tech`
 
 ## Quick Start
 
