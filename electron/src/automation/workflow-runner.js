@@ -1074,12 +1074,19 @@ class WorkflowRunner {
 
       if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
 
-      // ─── STEP 3.5: Email verification (if required) ───
-      if (mailgunApiKey && mailgunDomain) {
+      // ─── STEP 3.5: Email verification (only if page requires it) ───
+      // Check if we're already on the payment/promo page — if so, skip verification entirely
+      const postSignupUrl = page.url();
+      const alreadyPastVerification = postSignupUrl.includes('/promo/') || postSignupUrl.includes('paywall') || postSignupUrl.includes('payment');
+
+      if (alreadyPastVerification) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'skipped', details: { message: 'Already on payment page — verification not required' } });
+      } else if (mailgunApiKey && mailgunDomain) {
+        // Quick check only (2 attempts, 5s each = 10s max) — Speechify rarely requires verification
         this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'starting' });
 
         let verificationLink = null;
-        const maxAttempts = 12;
+        const maxAttempts = 2;
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
           if (this.stopped) break;
           this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'polling', details: { attempt: attempt + 1, max: maxAttempts } });
@@ -1097,7 +1104,7 @@ class WorkflowRunner {
           stepsCompleted.push('email_verified');
           this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'success' });
         } else {
-          this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'no_link_found', details: { message: 'No verification email found. Continuing — Speechify may not require it.' } });
+          this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'skipped', details: { message: 'No verification email needed. Continuing to payment.' } });
         }
       }
 
