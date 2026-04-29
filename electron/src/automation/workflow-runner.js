@@ -1143,20 +1143,48 @@ class WorkflowRunner {
       // ─── STEP 5: Open payment modal + fill Stripe form via CDP ───
       this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'starting' });
 
-      // Click "Claim 100% Discount" button to open payment modal
+      // Click the payment/claim button to open payment modal
+      // Button text varies: "Claim 100% Discount", "Start Free Trial", "Subscribe", "Continue", etc.
       const claimClicked = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button'));
-        const claimBtn = buttons.find(b => b.textContent.includes('Claim 100% Discount'));
-        if (claimBtn) { claimBtn.click(); return true; }
-        return false;
+        const buttons = Array.from(document.querySelectorAll('button, a[role="button"]'));
+        const paymentKeywords = ['Claim', 'Discount', 'Subscribe', 'Start', 'Trial', 'Buy', 'Pay', 'Get Premium', 'Continue to payment'];
+        // Find the most prominent payment-related button
+        let claimBtn = buttons.find(b => b.textContent.includes('Claim 100% Discount'));
+        if (!claimBtn) claimBtn = buttons.find(b => b.textContent.includes('Claim'));
+        if (!claimBtn) claimBtn = buttons.find(b => b.textContent.includes('Start Free Trial'));
+        if (!claimBtn) claimBtn = buttons.find(b => b.textContent.includes('Subscribe'));
+        if (!claimBtn) claimBtn = buttons.find(b => {
+          const text = b.textContent.trim();
+          return paymentKeywords.some(k => text.includes(k)) && text.length < 60;
+        });
+        if (claimBtn) { claimBtn.click(); return claimBtn.textContent.trim(); }
+        return null;
       });
 
+      this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'claim_button', details: { clicked: claimClicked } });
+
       if (claimClicked) {
+        await humanDelay(5000, 8000); // Give Stripe iframe extra time to load
+      } else {
+        // No specific claim button found — the payment form may already be inline on the page
         await humanDelay(3000, 5000);
       }
 
-      // Fill Stripe payment form via CDP (cross-origin iframe)
-      await this.fillStripePaymentForm(page, browser, cardNumber, cardExpiry, cardCvc, workflowId);
+      // Fill Stripe payment form via CDP (cross-origin iframe) with retry
+      // Stripe iframe can take a few seconds to load after clicking the claim button
+      let stripeAttempts = 0;
+      const maxStripeAttempts = 3;
+      while (stripeAttempts < maxStripeAttempts) {
+        try {
+          await this.fillStripePaymentForm(page, browser, cardNumber, cardExpiry, cardCvc, workflowId);
+          break;
+        } catch (err) {
+          stripeAttempts++;
+          if (stripeAttempts >= maxStripeAttempts) throw err;
+          this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'stripe_retry', details: { attempt: stripeAttempts, error: err.message } });
+          await new Promise(r => setTimeout(r, 5000)); // Wait 5s and retry
+        }
+      }
       stepsCompleted.push('payment_form_filled');
 
       if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
@@ -1531,10 +1559,12 @@ class WorkflowRunner {
     // Find the Stripe iframe target with card input fields
     // Stripe uses various iframe URLs — match any stripe.com iframe, then verify
     // which one actually has card inputs via CDP check
+    // Match any stripe.com iframe — check for card inputs via CDP later
     const stripeTargets = targets.filter(t =>
-      t.type === 'iframe' && t.url && t.url.includes('stripe.com') &&
-      (t.url.includes('elements-inner') || t.url.includes('payment'))
+      t.type === 'iframe' && t.url && t.url.includes('stripe.com')
     );
+
+    this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'cdp_targets', details: { total: targets.length, stripe: stripeTargets.length, stripeUrls: stripeTargets.map(t => t.url.substring(0, 100)) } });
 
     let stripeWsUrl = null;
     for (const target of stripeTargets) {
