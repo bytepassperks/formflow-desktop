@@ -143,7 +143,7 @@ document.getElementById('loadSpeechifyPresetBtn').addEventListener('click', () =
   document.getElementById('parallelRuns').value = '1';
   document.getElementById('maxRetries').value = '2';
   document.getElementById('numProfiles').value = '1';
-  document.getElementById('navTimeout').value = '30000';
+  document.getElementById('navTimeout').value = '60000';
   document.getElementById('selectorTimeout').value = '15000';
   document.getElementById('actionDelay').value = '800';
 

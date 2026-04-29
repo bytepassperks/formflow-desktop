@@ -1047,7 +1047,7 @@ class WorkflowRunner {
 
       const landingUrl = config.target_url || 'https://speechify.com/l/wondertools';
       if (!page.url().includes('speechify.com')) {
-        await page.goto(landingUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(landingUrl, { waitUntil: 'networkidle2', timeout: 60000 });
       }
       await humanDelay(2000, 3000);
 
@@ -1092,7 +1092,7 @@ class WorkflowRunner {
 
         if (verificationLink) {
           this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'link_found' });
-          await page.goto(verificationLink, { waitUntil: 'networkidle2', timeout: 30000 });
+          await page.goto(verificationLink, { waitUntil: 'networkidle2', timeout: 60000 });
           await humanDelay(3000, 5000);
           stepsCompleted.push('email_verified');
           this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'success' });
@@ -1109,7 +1109,7 @@ class WorkflowRunner {
       if (!currentUrl.includes('/promo/') && !currentUrl.includes('paywall')) {
         // Navigate to the promo paywall URL
         const promoUrl = 'https://speechify.com/onboarding/nc/promo/paywall-p/?promo=JDKSN292NDKWON&priceId=price_1QpTYsBtf7hakIXChv4GUhEG';
-        await page.goto(promoUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(promoUrl, { waitUntil: 'networkidle2', timeout: 60000 });
         await humanDelay(2000, 3000);
       }
 
@@ -1259,7 +1259,7 @@ class WorkflowRunner {
       this.emit('workflow_step', { workflow_id: workflowId, step: 7, action: 'verify_dashboard', status: 'starting' });
 
       // Navigate to Speechify dashboard
-      await page.goto('https://speechify.com/dashboard', { waitUntil: 'networkidle2', timeout: 30000 });
+      await page.goto('https://speechify.com/dashboard', { waitUntil: 'networkidle2', timeout: 60000 });
       await humanDelay(3000, 5000);
 
       const dashboardCheck = await page.evaluate(() => {
@@ -1332,10 +1332,12 @@ class WorkflowRunner {
         const text = document.body.innerText;
         const buttons = Array.from(document.querySelectorAll('button'));
         const buttonTexts = buttons.map(b => b.textContent.trim()).filter(t => t.length > 0 && t.length < 100);
+        const hasEmailInput = !!(document.querySelector('input[type="email"]') || document.querySelector('input[name="email"]') || document.querySelector('input[placeholder*="mail"]'));
+        const hasPasswordInput = !!(document.querySelector('input[type="password"]') || document.querySelector('input[name="password"]'));
         return {
           url: window.location.href,
           hasOnboarding: text.includes('How do you') || text.includes('What would you') || text.includes('Choose') || text.includes('want to listen'),
-          hasSignup: text.includes('Create your account') || text.includes('Sign up') || text.includes('Email'),
+          hasSignup: hasEmailInput || text.includes('Create your account') || text.includes('Sign up'),
           hasPayment: text.includes('Payment') || text.includes('$0.00') || text.includes('Discount'),
           buttonTexts,
         };
@@ -1353,14 +1355,18 @@ class WorkflowRunner {
         return;
       }
 
-      // Click the first visible option button (not navigation buttons)
+      // Click the first visible option button (not navigation/social login buttons)
       const clicked = await page.evaluate(() => {
         const buttons = Array.from(document.querySelectorAll('button'));
-        // Filter out navigation/close buttons — look for option buttons
+        // Filter out navigation/close/social login buttons — look for onboarding option buttons
+        const skipTexts = ['Next', 'Back', 'Skip', 'Close', 'X', 'Log in', 'Login', 'Sign in'];
+        const socialPrefixes = ['Continue with', 'Sign in with', 'Sign up with', 'Log in with'];
         const optionBtns = buttons.filter(b => {
           const text = b.textContent.trim();
           if (text.length === 0 || text.length > 80) return false;
-          if (['Next', 'Back', 'Skip', 'Close', 'X'].includes(text)) return false;
+          if (skipTexts.includes(text)) return false;
+          if (socialPrefixes.some(p => text.startsWith(p))) return false;
+          if (text === 'Continue') return false; // Skip generic Continue — handled separately
           // Likely an option if it's inside the main content area
           const rect = b.getBoundingClientRect();
           return rect.width > 50 && rect.height > 20 && rect.top > 100;

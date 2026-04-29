@@ -3,7 +3,7 @@
   "description": "Automated Speechify onboarding, account creation, and $0 premium subscription via promo code JDKSN292NDKWON",
   "workflow_type": "speechify",
   "target_url": "https://speechify.com/l/wondertools",
-  "navigation_timeout_ms": 30000,
+  "navigation_timeout_ms": 60000,
   "selector_timeout_ms": 15000,
   "action_delay_ms": 800,
   "credentials": {
