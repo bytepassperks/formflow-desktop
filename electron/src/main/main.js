@@ -14,6 +14,20 @@ const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
+// Global error handlers — show dialog instead of silently crashing
+process.on('uncaughtException', (err) => {
+  const msg = `Uncaught Exception:\n${err.stack || err.message}`;
+  fs.appendFileSync(path.join(app.isPackaged ? path.dirname(app.getPath('exe')) : __dirname, 'crash.log'), `${new Date().toISOString()} ${msg}\n`);
+  if (app.isReady()) {
+    dialog.showErrorBox('FormFlow Desktop Pro — Error', msg);
+  }
+});
+
+process.on('unhandledRejection', (reason) => {
+  const msg = `Unhandled Rejection:\n${reason && reason.stack ? reason.stack : String(reason)}`;
+  fs.appendFileSync(path.join(app.isPackaged ? path.dirname(app.getPath('exe')) : __dirname, 'crash.log'), `${new Date().toISOString()} ${msg}\n`);
+});
+
 // ═══════════════════════════════════════════════════
 // STEALTH CHROMIUM FLAGS — Applied at process level
 // These disable ALL automation detection mechanisms
@@ -124,6 +138,18 @@ function createMainWindow() {
 }
 
 app.whenReady().then(() => {
+  // Log startup info for debugging
+  const startupLog = [
+    `App ready at ${new Date().toISOString()}`,
+    `isPackaged: ${app.isPackaged}`,
+    `APP_ROOT: ${APP_ROOT}`,
+    `RESOURCES_ROOT: ${RESOURCES_ROOT}`,
+    `exe path: ${app.getPath('exe')}`,
+    `PROFILES_DIR: ${PROFILES_DIR} (exists: ${fs.existsSync(PROFILES_DIR)})`,
+    `CONFIG_DIR: ${CONFIG_DIR} (exists: ${fs.existsSync(CONFIG_DIR)})`,
+  ].join('\n');
+  fs.appendFileSync(path.join(APP_ROOT, 'startup.log'), startupLog + '\n');
+
   createMainWindow();
 
   app.on('activate', () => {
