@@ -410,6 +410,15 @@ class WorkflowRunner {
         return { ...vapiResult, networkInfo: { timezone: fingerprint.timezone, locale: fingerprint.locale, userAgent: fingerprint.userAgent, viewport: fingerprint.viewport } };
       }
 
+      // Check if this is a Speechify workflow (auto-detect or explicit)
+      const isSpeechifyWorkflow = config.target_url.includes('speechify.com') ||
+                                   (config.workflow_type && config.workflow_type === 'speechify');
+
+      if (isSpeechifyWorkflow) {
+        const speechifyResult = await this.executeSpeechifyWorkflow(page, config, workflowId, profileId, browser);
+        return { ...speechifyResult, networkInfo: { timezone: fingerprint.timezone, locale: fingerprint.locale, userAgent: fingerprint.userAgent, viewport: fingerprint.viewport } };
+      }
+
       // Execute generic workflow steps
       const steps = config.steps || [];
       for (const step of steps) {
@@ -986,6 +995,664 @@ class WorkflowRunner {
       }
     } catch (err) {
       this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'onboarding_survey', status: 'skipped', details: { error: err.message } });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════
+  // Speechify Workflow — Full onboarding + payment automation
+  // ═══════════════════════════════════════════════════
+  //
+  // Flow:
+  // 1. Navigate to speechify.com/l/wondertools (promo landing)
+  // 2. Answer onboarding questions (use case, how you listen)
+  // 3. Create account with email + password
+  // 4. Reach payment page with 100% discount promo
+  // 5. Fill Stripe payment form via CDP (cross-origin iframe)
+  // 6. Submit payment ($0.00)
+  // 7. Verify dashboard access
+  // ═══════════════════════════════════════════════════
+
+  async executeSpeechifyWorkflow(page, config, workflowId, profileId, browser) {
+    const creds = config.credentials || {};
+    const email = creds.email;
+    const password = creds.password;
+    const cardNumber = creds.card_number || creds.cardNumber || '5598880369500915';
+    const cardExpiry = creds.card_expiry || creds.cardExpiry || '0927';
+    const cardCvc = creds.card_cvc || creds.cardCvc || '801';
+    const mailgunApiKey = creds.mailgun_api_key || creds.mailgunApiKey || '';
+    const mailgunDomain = creds.mailgun_domain || creds.mailgunDomain || '';
+
+    if (!email || !password) {
+      throw new Error('Speechify workflow requires email and password in credentials');
+    }
+
+    const stepsCompleted = [];
+    const timeoutMs = config.selector_timeout_ms || 15000;
+
+    const humanDelay = (min = 500, max = 1500) => {
+      const ms = Math.floor(Math.random() * (max - min) + min);
+      return new Promise(r => setTimeout(r, ms));
+    };
+
+    const humanType = async (selector, text) => {
+      await page.click(selector, { clickCount: 3 });
+      await humanDelay(100, 300);
+      await page.type(selector, text, { delay: 20 });
+      await humanDelay(200, 500);
+    };
+
+    try {
+      // ─── STEP 1: Navigate to Speechify promo landing ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 1, action: 'navigate_speechify', status: 'starting' });
+
+      const landingUrl = config.target_url || 'https://speechify.com/l/wondertools';
+      if (!page.url().includes('speechify.com')) {
+        await page.goto(landingUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      }
+      await humanDelay(2000, 3000);
+
+      this.emit('workflow_step', { workflow_id: workflowId, step: 1, action: 'navigate_speechify', status: 'success', details: { url: page.url() } });
+      stepsCompleted.push('navigate_landing');
+
+      if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
+
+      // ─── STEP 2: Handle onboarding questions ───
+      // Speechify shows multi-step onboarding questions before signup.
+      // The questions vary but typically include use case and listening preferences.
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'onboarding_questions', status: 'starting' });
+
+      await this.handleSpeechifyOnboarding(page, workflowId);
+      stepsCompleted.push('onboarding_questions');
+
+      if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
+
+      // ─── STEP 3: Create account (email + password) ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: 'starting' });
+
+      await this.handleSpeechifySignup(page, email, password, workflowId);
+      stepsCompleted.push('account_created');
+
+      if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
+
+      // ─── STEP 3.5: Email verification (if required) ───
+      if (mailgunApiKey && mailgunDomain) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'starting' });
+
+        let verificationLink = null;
+        const maxAttempts = 12;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          if (this.stopped) break;
+          this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'polling', details: { attempt: attempt + 1, max: maxAttempts } });
+
+          verificationLink = await this.fetchSpeechifyVerificationLink(mailgunApiKey, mailgunDomain, email);
+          if (verificationLink) break;
+
+          await new Promise(r => setTimeout(r, 5000));
+        }
+
+        if (verificationLink) {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'link_found' });
+          await page.goto(verificationLink, { waitUntil: 'networkidle2', timeout: 30000 });
+          await humanDelay(3000, 5000);
+          stepsCompleted.push('email_verified');
+          this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'success' });
+        } else {
+          this.emit('workflow_step', { workflow_id: workflowId, step: 3.5, action: 'email_verification', status: 'no_link_found', details: { message: 'No verification email found. Continuing — Speechify may not require it.' } });
+        }
+      }
+
+      // ─── STEP 4: Navigate to payment page + verify $0 promo ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'payment_page', status: 'starting' });
+
+      // Check if we're already on the promo paywall page
+      const currentUrl = page.url();
+      if (!currentUrl.includes('/promo/') && !currentUrl.includes('paywall')) {
+        // Navigate to the promo paywall URL
+        const promoUrl = 'https://speechify.com/onboarding/nc/promo/paywall-p/?promo=JDKSN292NDKWON&priceId=price_1QpTYsBtf7hakIXChv4GUhEG';
+        await page.goto(promoUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await humanDelay(2000, 3000);
+      }
+
+      // Verify $0.00 pricing is shown
+      const pricingCheck = await page.evaluate(() => {
+        const text = document.body.innerText;
+        return {
+          hasDiscount: text.includes('-100%') || text.includes('100% off'),
+          hasFreePrice: text.includes('$0.00'),
+          hasPromo: text.includes('JDKSN292NDKWON'),
+        };
+      });
+
+      this.emit('workflow_step', { workflow_id: workflowId, step: 4, action: 'payment_page', status: 'price_verified', details: pricingCheck });
+
+      if (!pricingCheck.hasFreePrice) {
+        throw new Error('Payment page does NOT show $0.00 — aborting to prevent charges');
+      }
+
+      stepsCompleted.push('payment_page_verified');
+
+      if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
+
+      // ─── STEP 5: Open payment modal + fill Stripe form via CDP ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'starting' });
+
+      // Click "Claim 100% Discount" button to open payment modal
+      const claimClicked = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const claimBtn = buttons.find(b => b.textContent.includes('Claim 100% Discount'));
+        if (claimBtn) { claimBtn.click(); return true; }
+        return false;
+      });
+
+      if (claimClicked) {
+        await humanDelay(3000, 5000);
+      }
+
+      // Fill Stripe payment form via CDP (cross-origin iframe)
+      await this.fillStripePaymentForm(page, browser, cardNumber, cardExpiry, cardCvc, workflowId);
+      stepsCompleted.push('payment_form_filled');
+
+      if (this.stopped) return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length, stopped: true };
+
+      // ─── STEP 6: Submit payment (click Buy Now) ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'submit_payment', status: 'starting' });
+
+      const submitted = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const buyBtn = buttons.find(b => b.textContent.includes('Buy Now'));
+        if (buyBtn) { buyBtn.click(); return true; }
+        return false;
+      });
+
+      if (submitted) {
+        await humanDelay(5000, 10000);
+
+        // Check for success indicators
+        const postPayment = await page.evaluate(() => {
+          const text = document.body.innerText.toLowerCase();
+          return {
+            url: window.location.href,
+            hasWelcome: text.includes('welcome') || text.includes('congratulations') || text.includes('success'),
+            hasDashboard: text.includes('library') || text.includes('home') || text.includes('dashboard'),
+            hasError: text.includes('error') || text.includes('declined') || text.includes('failed'),
+          };
+        });
+
+        this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'submit_payment', status: postPayment.hasError ? 'error' : 'success', details: postPayment });
+
+        if (postPayment.hasError) {
+          throw new Error('Payment submission failed — card may have been declined');
+        }
+
+        stepsCompleted.push('payment_submitted');
+      } else {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 6, action: 'submit_payment', status: 'failed', details: { message: 'Could not find Buy Now button' } });
+      }
+
+      // ─── STEP 7: Verify dashboard access ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 7, action: 'verify_dashboard', status: 'starting' });
+
+      // Navigate to Speechify dashboard
+      await page.goto('https://speechify.com/dashboard', { waitUntil: 'networkidle2', timeout: 30000 });
+      await humanDelay(3000, 5000);
+
+      const dashboardCheck = await page.evaluate(() => {
+        const text = document.body.innerText.toLowerCase();
+        return {
+          url: window.location.href,
+          isLoggedIn: !text.includes('sign in') && !text.includes('log in') && !text.includes('create account'),
+          hasDashboard: text.includes('library') || text.includes('home') || text.includes('listen') || text.includes('speechify'),
+        };
+      });
+
+      this.emit('workflow_step', { workflow_id: workflowId, step: 7, action: 'verify_dashboard', status: dashboardCheck.isLoggedIn ? 'success' : 'failed', details: dashboardCheck });
+
+      if (dashboardCheck.isLoggedIn) {
+        stepsCompleted.push('dashboard_verified');
+      }
+
+      // ─── STEP 8: Logout ───
+      this.emit('workflow_step', { workflow_id: workflowId, step: 8, action: 'logout', status: 'starting' });
+
+      const loggedOut = await page.evaluate(() => {
+        // Look for settings/profile menu to find logout
+        const avatarBtn = document.querySelector('[data-testid="user-avatar"], [aria-label="Profile"], button[aria-label="Account"]');
+        if (avatarBtn) { avatarBtn.click(); return 'menu_opened'; }
+        // Try finding any logout link directly
+        const logoutLinks = Array.from(document.querySelectorAll('a, button')).filter(el => el.textContent.toLowerCase().includes('log out') || el.textContent.toLowerCase().includes('sign out'));
+        if (logoutLinks.length > 0) { logoutLinks[0].click(); return 'logout_clicked'; }
+        return 'no_logout_found';
+      });
+
+      if (loggedOut === 'menu_opened') {
+        await humanDelay(500, 1000);
+        await page.evaluate(() => {
+          const items = Array.from(document.querySelectorAll('a, button, div[role="menuitem"]'));
+          const logoutItem = items.find(el => el.textContent.toLowerCase().includes('log out') || el.textContent.toLowerCase().includes('sign out'));
+          if (logoutItem) logoutItem.click();
+        });
+        await humanDelay(2000, 3000);
+        stepsCompleted.push('logout');
+        this.emit('workflow_step', { workflow_id: workflowId, step: 8, action: 'logout', status: 'success' });
+      } else if (loggedOut === 'logout_clicked') {
+        await humanDelay(2000, 3000);
+        stepsCompleted.push('logout');
+        this.emit('workflow_step', { workflow_id: workflowId, step: 8, action: 'logout', status: 'success' });
+      } else {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 8, action: 'logout', status: 'skipped', details: { message: 'Could not find logout button' } });
+      }
+
+      return { steps_completed: stepsCompleted, steps_executed: stepsCompleted.length };
+
+    } catch (err) {
+      try {
+        const screenshotPath = path.join(this.screenshotsDir, `speechify_error_${Date.now()}.png`);
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        this.emit('workflow_step', { workflow_id: workflowId, action: 'error_screenshot', details: { path: screenshotPath } });
+      } catch {}
+      throw err;
+    }
+  }
+
+  async handleSpeechifyOnboarding(page, workflowId) {
+    // Handle multi-step onboarding questions on speechify.com
+    // Questions vary but typically ask about use case and listening preferences
+    const maxSteps = 10;
+
+    for (let step = 0; step < maxSteps; step++) {
+      await new Promise(r => setTimeout(r, 2000));
+
+      const pageState = await page.evaluate(() => {
+        const text = document.body.innerText;
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const buttonTexts = buttons.map(b => b.textContent.trim()).filter(t => t.length > 0 && t.length < 100);
+        return {
+          url: window.location.href,
+          hasOnboarding: text.includes('How do you') || text.includes('What would you') || text.includes('Choose') || text.includes('want to listen'),
+          hasSignup: text.includes('Create your account') || text.includes('Sign up') || text.includes('Email'),
+          hasPayment: text.includes('Payment') || text.includes('$0.00') || text.includes('Discount'),
+          buttonTexts,
+        };
+      });
+
+      this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'onboarding_questions', status: 'step_' + step, details: pageState });
+
+      // If we've reached signup or payment page, onboarding is done
+      if (pageState.hasSignup || pageState.hasPayment) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'onboarding_questions', status: 'success', details: { steps_taken: step } });
+        return;
+      }
+
+      if (!pageState.hasOnboarding && step > 0) {
+        return;
+      }
+
+      // Click the first visible option button (not navigation buttons)
+      const clicked = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        // Filter out navigation/close buttons — look for option buttons
+        const optionBtns = buttons.filter(b => {
+          const text = b.textContent.trim();
+          if (text.length === 0 || text.length > 80) return false;
+          if (['Next', 'Back', 'Skip', 'Close', 'X'].includes(text)) return false;
+          // Likely an option if it's inside the main content area
+          const rect = b.getBoundingClientRect();
+          return rect.width > 50 && rect.height > 20 && rect.top > 100;
+        });
+
+        if (optionBtns.length > 0) {
+          // Pick a random option for variety
+          const idx = Math.floor(Math.random() * optionBtns.length);
+          optionBtns[idx].click();
+          return optionBtns[idx].textContent.trim();
+        }
+        return null;
+      });
+
+      if (clicked) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 2, action: 'onboarding_questions', status: 'option_selected', details: { selected: clicked } });
+        await new Promise(r => setTimeout(r, 1500));
+
+        // Click "Next" or "Continue" if present
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const nextBtn = buttons.find(b => {
+            const text = b.textContent.trim();
+            return text === 'Next' || text === 'Continue' || text.startsWith('Next');
+          });
+          if (nextBtn && !nextBtn.disabled) nextBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 2000));
+      } else {
+        // No option buttons found — try clicking any prominent button
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const btn = buttons.find(b => {
+            const text = b.textContent.trim();
+            return text === 'Get Started' || text === 'Continue' || text === 'Start';
+          });
+          if (btn) btn.click();
+        });
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+  }
+
+  async handleSpeechifySignup(page, email, password, workflowId) {
+    // Handle the Speechify account creation page
+    // Look for email/password fields and fill them
+    this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: 'filling_form' });
+
+    // Wait for signup form to appear
+    let formFound = false;
+    for (let i = 0; i < 10; i++) {
+      formFound = await page.evaluate(() => {
+        return !!(document.querySelector('input[type="email"]') || document.querySelector('input[name="email"]'));
+      });
+      if (formFound) break;
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
+    if (!formFound) {
+      // Check if we're already past signup (already on payment page)
+      const alreadyPastSignup = await page.evaluate(() => {
+        const text = document.body.innerText;
+        return text.includes('Payment') || text.includes('$0.00') || text.includes('Discount');
+      });
+      if (alreadyPastSignup) {
+        this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: 'skipped', details: { message: 'Already past signup — on payment page' } });
+        return;
+      }
+      throw new Error('Could not find signup form within 20 seconds');
+    }
+
+    // Fill email
+    const emailSelector = await page.evaluate(() => {
+      if (document.querySelector('input[type="email"]')) return 'input[type="email"]';
+      if (document.querySelector('input[name="email"]')) return 'input[name="email"]';
+      if (document.querySelector('input[placeholder*="email" i]')) return 'input[placeholder*="email" i]';
+      return null;
+    });
+
+    if (emailSelector) {
+      await page.click(emailSelector, { clickCount: 3 });
+      await new Promise(r => setTimeout(r, 200));
+      await page.type(emailSelector, email, { delay: 25 });
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    // Fill password
+    const passwordSelector = await page.evaluate(() => {
+      if (document.querySelector('input[type="password"]')) return 'input[type="password"]';
+      if (document.querySelector('input[name="password"]')) return 'input[name="password"]';
+      return null;
+    });
+
+    if (passwordSelector) {
+      await page.click(passwordSelector, { clickCount: 3 });
+      await new Promise(r => setTimeout(r, 200));
+      await page.type(passwordSelector, password, { delay: 25 });
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    // Submit signup form
+    const submitted = await page.evaluate(() => {
+      // Try submit button
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const submitBtn = buttons.find(b => {
+        const text = b.textContent.trim().toLowerCase();
+        return text.includes('sign up') || text.includes('create account') || text.includes('continue') || text.includes('get started') || b.type === 'submit';
+      });
+      if (submitBtn) { submitBtn.click(); return submitBtn.textContent.trim(); }
+      // Try form submit
+      const form = document.querySelector('form');
+      if (form) { form.submit(); return 'form.submit()'; }
+      return null;
+    });
+
+    this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: 'submitted', details: { button: submitted, email } });
+
+    // Wait for navigation/response
+    await new Promise(r => setTimeout(r, 5000));
+
+    // Verify we're past signup
+    const postSignup = await page.evaluate(() => {
+      const text = document.body.innerText;
+      return {
+        url: window.location.href,
+        hasPayment: text.includes('Payment') || text.includes('$0.00') || text.includes('Discount') || text.includes('Premium'),
+        hasVerification: text.includes('verify') || text.includes('confirmation') || text.includes('check your email'),
+        hasError: text.includes('already exists') || text.includes('invalid') || text.includes('error'),
+      };
+    });
+
+    this.emit('workflow_step', { workflow_id: workflowId, step: 3, action: 'create_account', status: postSignup.hasError ? 'error' : 'success', details: postSignup });
+  }
+
+  async fillStripePaymentForm(page, browser, cardNumber, cardExpiry, cardCvc, workflowId) {
+    // Fill Stripe Payment Element form via Chrome DevTools Protocol (CDP).
+    // Stripe loads in a cross-origin iframe from js.stripe.com which cannot be
+    // accessed via standard Puppeteer frame APIs. We connect directly to the
+    // iframe's CDP target to manipulate its DOM.
+    this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'connecting_cdp' });
+
+    // Get the CDP port from the browser's WebSocket URL
+    const wsUrl = browser.wsEndpoint();
+    const cdpPort = new URL(wsUrl).port;
+
+    // Discover Stripe iframe targets via CDP /json endpoint
+    const targets = await new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${cdpPort}/json`, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+      }).on('error', reject);
+    });
+
+    // Find the Stripe iframe target with card input fields
+    const stripeTargets = targets.filter(t =>
+      t.type === 'iframe' && t.url && t.url.includes('stripe.com') &&
+      t.url.includes('elements-inner')
+    );
+
+    let stripeWsUrl = null;
+    for (const target of stripeTargets) {
+      if (!target.webSocketDebuggerUrl) continue;
+      stripeWsUrl = target.webSocketDebuggerUrl;
+
+      // Connect and verify this frame has card inputs
+      try {
+        const hasInputs = await this.checkStripeFrameHasInputs(stripeWsUrl);
+        if (hasInputs) break;
+        stripeWsUrl = null;
+      } catch {
+        stripeWsUrl = null;
+      }
+    }
+
+    if (!stripeWsUrl) {
+      this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'error', details: { message: 'Could not find Stripe iframe with card inputs' } });
+      throw new Error('Stripe payment iframe not found — cannot fill card details');
+    }
+
+    this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'filling_card' });
+
+    // Connect to Stripe iframe and fill card details using DOM manipulation
+    await this.fillStripeFieldsViaCDP(stripeWsUrl, cardNumber, cardExpiry, cardCvc);
+
+    this.emit('workflow_step', { workflow_id: workflowId, step: 5, action: 'fill_payment', status: 'success', details: { card_last4: cardNumber.slice(-4) } });
+  }
+
+  async checkStripeFrameHasInputs(wsUrl) {
+    // Quick check if a Stripe iframe target has card input fields
+    const WebSocket = require('ws');
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(wsUrl);
+      let msgId = 1;
+      let timeout;
+
+      ws.on('open', () => {
+        // Enable Runtime and check for inputs
+        ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.enable' }));
+        ws.send(JSON.stringify({
+          id: msgId++,
+          method: 'Runtime.evaluate',
+          params: {
+            expression: `(() => {
+              const inputs = document.querySelectorAll('input');
+              return Array.from(inputs).some(i => i.autocomplete === 'cc-number' || i.name === 'number' || i.name === 'cardnumber');
+            })()`,
+            returnByValue: true,
+          },
+        }));
+        timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
+      });
+
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data);
+        if (msg.id === 2 && msg.result && msg.result.result) {
+          clearTimeout(timeout);
+          ws.close();
+          resolve(!!msg.result.result.value);
+        }
+      });
+
+      ws.on('error', () => { clearTimeout(timeout); resolve(false); });
+    });
+  }
+
+  async fillStripeFieldsViaCDP(wsUrl, cardNumber, cardExpiry, cardCvc) {
+    // Connect to Stripe iframe via WebSocket and fill card fields using
+    // the native input value setter + dispatching input/change events.
+    // This updates Stripe's internal state properly.
+    const WebSocket = require('ws');
+
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(wsUrl);
+      let msgId = 1;
+      let timeout;
+      const pendingCallbacks = {};
+
+      const sendCmd = (method, params) => {
+        const id = msgId++;
+        return new Promise((res, rej) => {
+          pendingCallbacks[id] = res;
+          ws.send(JSON.stringify({ id, method, params }));
+          setTimeout(() => { delete pendingCallbacks[id]; rej(new Error('CDP command timeout')); }, 10000);
+        });
+      };
+
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data);
+        if (msg.id && pendingCallbacks[msg.id]) {
+          pendingCallbacks[msg.id](msg);
+          delete pendingCallbacks[msg.id];
+        }
+      });
+
+      ws.on('open', async () => {
+        try {
+          await sendCmd('Runtime.enable');
+          await sendCmd('DOM.enable');
+
+          // Format expiry as "MM / YY"
+          const expMonth = cardExpiry.substring(0, 2);
+          const expYear = cardExpiry.substring(2, 4);
+          const formattedExpiry = `${expMonth} / ${expYear}`;
+
+          // Fill all three fields using native setter + input events
+          const fillResult = await sendCmd('Runtime.evaluate', {
+            expression: `(() => {
+              function fillField(selector, value) {
+                const input = document.querySelector(selector);
+                if (!input) return 'not_found: ' + selector;
+                input.focus();
+                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                nativeSetter.call(input, value);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.dispatchEvent(new Event('blur', { bubbles: true }));
+                return 'filled: ' + input.value;
+              }
+
+              const results = {};
+              results.card = fillField('input[name="number"], input[autocomplete="cc-number"]', '${cardNumber}');
+              results.exp = fillField('input[name="expiry"], input[autocomplete="cc-exp"]', '${formattedExpiry}');
+              results.cvc = fillField('input[name="cvc"], input[autocomplete="cc-csc"]', '${cardCvc}');
+              return JSON.stringify(results);
+            })()`,
+            returnByValue: true,
+          });
+
+          // Also try execCommand('insertText') as an alternative approach
+          // This generates "trusted" input events that Stripe's handlers recognize
+          await sendCmd('Runtime.evaluate', {
+            expression: `(() => {
+              function fillWithExecCommand(selector, value) {
+                const input = document.querySelector(selector);
+                if (!input) return false;
+                input.focus();
+                input.select();
+                document.execCommand('delete');
+                document.execCommand('insertText', false, value);
+                return true;
+              }
+
+              fillWithExecCommand('input[name="number"], input[autocomplete="cc-number"]', '${cardNumber}');
+              fillWithExecCommand('input[name="expiry"], input[autocomplete="cc-exp"]', '${formattedExpiry}');
+              fillWithExecCommand('input[name="cvc"], input[autocomplete="cc-csc"]', '${cardCvc}');
+              return 'done';
+            })()`,
+            returnByValue: true,
+          });
+
+          ws.close();
+          resolve();
+        } catch (err) {
+          ws.close();
+          reject(err);
+        }
+      });
+
+      ws.on('error', (err) => { reject(err); });
+      timeout = setTimeout(() => { ws.close(); reject(new Error('Stripe CDP fill timeout')); }, 30000);
+    });
+  }
+
+  async fetchSpeechifyVerificationLink(apiKey, domain, email) {
+    // Fetch Speechify verification link from Mailgun
+    try {
+      const RELAY_URL = 'https://mailgun-relay-gvqahkir.fly.dev';
+      const relayResponse = await this.httpGet(`${RELAY_URL}/verify-link/${encodeURIComponent(email)}`);
+
+      if (relayResponse && relayResponse.found && relayResponse.link) {
+        return relayResponse.link;
+      }
+
+      // Fallback: Mailgun stored messages API
+      const url = `https://api.mailgun.net/v3/${domain}/events?event=stored&recipient=${encodeURIComponent(email)}&limit=5`;
+      const response = await this.httpGet(url, { auth: `api:${apiKey}` });
+
+      if (response && response.items) {
+        for (const item of response.items) {
+          if (item.storage && item.storage.url) {
+            const message = await this.httpGet(item.storage.url, { auth: `api:${apiKey}` });
+            if (message && message['body-html']) {
+              // Look for Speechify verification links
+              const linkMatch = message['body-html'].match(/https:\/\/[^\s"'<]*speechify[^\s"'<]*(verify|confirm|activate)[^\s"'<]*/i);
+              if (linkMatch) return linkMatch[0].replace(/&amp;/g, '&');
+            }
+            if (message && message['body-plain']) {
+              const linkMatch = message['body-plain'].match(/https:\/\/[^\s]*(speechify|verify|confirm)[^\s]*/i);
+              if (linkMatch) return linkMatch[0];
+            }
+          }
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
     }
   }
 

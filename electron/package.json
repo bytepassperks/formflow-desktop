@@ -20,9 +20,11 @@
     "electron-builder": "^25.0.0"
   },
   "dependencies": {
-    "puppeteer-core": "^23.0.0",
     "node-fetch": "^3.3.2",
-    "uuid": "^10.0.0"
+    "puppeteer": "^23.11.1",
+    "puppeteer-core": "^23.0.0",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0"
   },
   "build": {
     "appId": "com.formflow.desktop-pro",
@@ -35,7 +37,9 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },
